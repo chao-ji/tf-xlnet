@@ -425,10 +425,26 @@ class TransformerXLModel(tf.keras.layers.Layer):
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
 
-    if tie_biases:
-      bias_shape = [num_heads, hidden_size // num_heads]
+    self._stack = []
+    for i in range(self._stack_size):
+      self._stack.append(DecoderLayer(hidden_size,
+                                      num_heads,
+                                      filter_size,
+                                      dropout_rate,
+                                      dropout_rate_attention))
+
+  def build(self, inputs_shape):
+    """Creates weights of this layer.
+
+    Args:
+      inputs_shape: tuple of ints or 1-D int tensor. Not used.
+    """
+    if self._tie_biases:
+      bias_shape = [self._num_heads, self._hidden_size // self._num_heads]
     else:
-      bias_shape = [stack_size, num_heads, hidden_size // num_heads]
+      bias_shape = [self._stack_size,
+                    self._num_heads,
+                    self._hidden_size // self._num_heads]
 
     self._content_bias = self.add_weight(
         'content_bias',
@@ -453,15 +469,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
         shape=bias_shape,
         dtype='float32',
         trainable=True)
-
-    self._stack = []
-
-    for i in range(self._stack_size):
-      self._stack.append(DecoderLayer(hidden_size,
-                                      num_heads,
-                                      filter_size,
-                                      dropout_rate,
-                                      dropout_rate_attention))
+    super(TransformerXLModel, self).build(inputs_shape)
 
   def call(self,
            content_stream,
@@ -696,6 +704,12 @@ class XLNetModel(tf.keras.layers.Layer):
                dropout_rate_attention=dropout_rate_attention,
                tie_biases=tie_biases)
 
+    self._dense_output = tf.keras.layers.Dense(
+          units=hidden_size,
+          kernel_initializer=None,
+          activation=lambda x: tf.keras.activations.gelu(x, approximate=True))
+    self._layernorm_output = tf.keras.layers.LayerNormalization(epsilon=1e-12)
+
   def build(self, inputs_shape):
     """Creates weights of this layer.
 
@@ -703,7 +717,7 @@ class XLNetModel(tf.keras.layers.Layer):
       inputs_shape: tuple of ints or 1-D int tensor. Not used.
     """
     self._segment_embedding = self.add_weight(
-            "segment_embedding",
+            'segment_embedding',
             shape=[self._stack_size, 2, self._num_heads, self._size_per_head],
             initializer=tf.keras.initializers.RandomNormal(
                 mean=0., stddev=self._hidden_size ** -0.5),
@@ -711,12 +725,18 @@ class XLNetModel(tf.keras.layers.Layer):
             trainable=True)
 
     self._mask_embedding = self.add_weight(
-            "mask_embedding",
+            'mask_embedding',
             shape=[1, 1, self._hidden_size],
             initializer=tf.keras.initializers.RandomNormal(
                 mean=0., stddev=self._hidden_size ** -0.5),
             dtype='float32',
             trainable=True)
+
+    self._bias_output= self.add_weight(
+        "bias_output",
+        shape=[self._vocab_size],
+        initializer=tf.zeros_initializer())
+
     super(XLNetModel, self).build(inputs_shape)
 
   def call(self, 
@@ -745,10 +765,12 @@ class XLNetModel(tf.keras.layers.Layer):
         block.
 
     Returns:
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.      
+      logits: float tensor of shape [batch_size, num_targets, vocab_size],
+        logits over vocabulary.
       new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
         hidden_size], updated memories.
+      query_stream: float tensor of shape [batch_size, num_targets,
+        hidden_size], input query stream.      
     """
     batch_size = tf.shape(inputs)[0]
     q_seq_len = tf.shape(inputs)[1]
@@ -776,70 +798,8 @@ class XLNetModel(tf.keras.layers.Layer):
         query_mask,
         mems=mems)
 
-    return query_stream, new_mems
+    outputs = self._layernorm_output(self._dense_output(query_stream))
+    logits = tf.einsum("NPD,VD->NPV", outputs, self._embedding_layer.weights[0]
+        ) + self._bias_output
 
-
-class LMLossLayer(tf.keras.layers.Layer):
-  """Layer computing cross entropy loss for language modeling."""
-  def __init__(self,
-               vocab_size,
-               hidden_size,
-               initializer,
-               tie_weight=False,
-               bi_data=True,
-               use_one_hot=False,
-               use_proj=False,
-               **kwargs):
-    super(LMLossLayer, self).__init__(**kwargs)
-    self.vocab_size = vocab_size
-    self.hidden_size = hidden_size
-    self.initializer = initializer
-
-    self.tie_weight = tie_weight
-    self.bi_data = bi_data
-    self.use_one_hot = use_one_hot
-    self.use_proj = use_proj
-
-  def build(self, unused_input_shapes):
-    """Implements build() for the layer."""
-    if self.use_proj:
-      self.proj_layer = tf.keras.layers.Dense(
-          units=self.hidden_size,
-          kernel_initializer=self.initializer,
-          activation=lambda x: tf.keras.activations.gelu(x, approximate=True),
-          name="lm_projection/dense")
-      self.proj_layer_norm = tf.keras.layers.LayerNormalization(
-          axis=-1, epsilon=1e-12, name="lm_projection/LayerNorm")
-    if not self.tie_weight:
-      self.softmax_w = self.add_weight(
-          "weight",
-          shape=[self.vocab_size, self.hidden_size],
-          initializer=self.initializer)
-
-    self.softmax_b = self.add_weight(
-        "bias", shape=[self.vocab_size], initializer=tf.zeros_initializer())
-
-    super(LMLossLayer, self).build(unused_input_shapes)
-
-  def call(self, hidden, target, lookup_table, target_mask):
-    """Implements call() for the layer."""
-    if self.use_proj:
-      hidden = self.proj_layer_norm(self.proj_layer(hidden))
-    if self.tie_weight:
-      logits = tf.einsum("ibd,nd->ibn", hidden, lookup_table) + self.softmax_b
-    else:
-      logits = tf.einsum("ibd,nd->ibn", hidden, self.softmax_w) + self.softmax_b
-
-    if self.use_one_hot:
-      one_hot_target = tf.one_hot(target, self.vocab_size, dtype=logits.dtype)
-      loss = -tf.reduce_sum(tf.nn.log_softmax(logits) * one_hot_target, -1)
-    else:
-      loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          labels=target, logits=logits)
-
-    total_loss = tf.reduce_sum(loss * target_mask) / tf.reduce_sum(target_mask)
-
-    return total_loss, logits
-
-
-
+    return logits, new_mems, query_stream
