@@ -704,12 +704,6 @@ class XLNetModel(tf.keras.layers.Layer):
                dropout_rate_attention=dropout_rate_attention,
                tie_biases=tie_biases)
 
-    self._dense_output = tf.keras.layers.Dense(
-          units=hidden_size,
-          kernel_initializer=None,
-          activation=lambda x: tf.keras.activations.gelu(x, approximate=True))
-    self._layernorm_output = tf.keras.layers.LayerNormalization(epsilon=1e-12)
-
   def build(self, inputs_shape):
     """Creates weights of this layer.
 
@@ -731,12 +725,6 @@ class XLNetModel(tf.keras.layers.Layer):
                 mean=0., stddev=self._hidden_size ** -0.5),
             dtype='float32',
             trainable=True)
-
-    self._bias_output= self.add_weight(
-        "bias_output",
-        shape=[self._vocab_size],
-        initializer=tf.zeros_initializer())
-
     super(XLNetModel, self).build(inputs_shape)
 
   def call(self, 
@@ -765,12 +753,10 @@ class XLNetModel(tf.keras.layers.Layer):
         block.
 
     Returns:
-      logits: float tensor of shape [batch_size, num_targets, vocab_size],
-        logits over vocabulary.
+      query_stream: float tensor of shape [batch_size, num_targets,
+        hidden_size], input query stream.
       new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
         hidden_size], updated memories.
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.      
     """
     batch_size = tf.shape(inputs)[0]
     q_seq_len = tf.shape(inputs)[1]
@@ -784,9 +770,9 @@ class XLNetModel(tf.keras.layers.Layer):
     segment_matrix = _compute_segment_matrix(segment_ids, m_seq_len)
 
     content_stream = self._dropout_layer(self._embedding_layer(inputs))
-    query_stream = self._dropout_layer(tf.broadcast_to(self._mask_embedding,
-        tf.shape(target_mapping)))
 
+    query_stream = self._dropout_layer(tf.tile(self._mask_embedding,
+        [batch_size, tf.shape(target_mapping)[1], 1]))
     query_stream, new_mems = self._transformer_xl(
         content_stream,
         query_stream,
@@ -798,8 +784,57 @@ class XLNetModel(tf.keras.layers.Layer):
         query_mask,
         mems=mems)
 
-    outputs = self._layernorm_output(self._dense_output(query_stream))
-    logits = tf.einsum("NPD,VD->NPV", outputs, self._embedding_layer.weights[0]
-        ) + self._bias_output
+    return query_stream, new_mems
 
-    return logits, new_mems, query_stream
+
+class PretrainLogits(tf.keras.layers.Layer):
+  """Converts query stream to final prediction logit for the permutation
+  language model objects.
+  """
+  def __init__(self, hidden_size, vocab_size):
+    """Constructor.
+
+    Args:
+      hidden_size: int scalar, the hidden size of continuous representation.
+      vocab_size: int scalar, vocabulary size.
+    """
+    super(PretrainLogits, self).__init__()
+    self._hidden_size = hidden_size
+    self._vocab_size = vocab_size
+
+    self._dense_output = tf.keras.layers.Dense(
+          units=hidden_size,
+          kernel_initializer=None,
+          activation=lambda x: tf.keras.activations.gelu(x, approximate=True))
+    self._layernorm_output = tf.keras.layers.LayerNormalization(epsilon=1e-12)
+
+  def build(self, inputs_shape):
+    """Creates weights of this layer.
+
+    Args:
+      inputs_shape: tuple of ints or 1-D int tensor. Not used.
+    """
+    self._bias_output= self.add_weight(
+        "bias_output",
+        shape=[self._vocab_size],
+        initializer=tf.zeros_initializer())
+    super(PretrainLogits, self).build(inputs_shape)
+
+  def call(self, query_stream, embeddings):
+    """Computes logits tensor.
+
+    Args:
+      query_stream: float tensor of shape [batch_size, num_targets,
+        hidden_size], input query stream.
+      embeddings: float tensor of shape [vocab_size, hidden_size], embedding
+        vectors for all tokens in the vocabulary.
+
+    Returns:
+      logits: float tensor of shape [batch_size, num_targets, vocab_size],
+        logits over vocabulary.
+    """
+    outputs = self._layernorm_output(self._dense_output(query_stream))
+    logits = tf.einsum("NPD,VD->NPV", outputs, embeddings 
+        ) + self._bias_output
+    return logits
+
