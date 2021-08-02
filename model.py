@@ -1,263 +1,27 @@
 """Defines XLNet model in tf.keras.API."""
-import numpy as np
-
 import tensorflow as tf
-import math
-from commons.layers import Projection
 from commons.layers import FeedForwardNetwork
-from commons.beam_search import NEG_INF
+from commons.layers import RelativeAttention
 
-
-SEG_ID_CLS = 2
-
-def cache_memory(inputs, mems=None, mem_len=0, reuse_len=0):
-  """
-  """
-  if reuse_len > 0:
-    inputs = inputs[:, :reuse_len]
-  if mems is None:
-    new_mem = inputs[:, -mem_len:]
-  else:
-    new_mem = tf.concat([mems, inputs[:, :reuse_len]], 1)[:, -mem_len:]
-  return tf.stop_gradient(new_mem)
-
-
-def rel_shift(inputs):
-  """"""
-  shape = tf.shape(inputs)
-  padded = tf.pad(inputs, [[0, 0], [0, 0], [0, 0], [1, 0]])
-  reshaped = tf.reshape(padded, [shape[0], shape[1], shape[3] + 1, shape[2]])
-  sliced = reshaped[:, :, 1:]
-  outputs = tf.reshape(sliced, shape)
-  return outputs
-
-
-class Attention(tf.keras.layers.Layer):
-  """Multi-headed attention layer used in XLNet model. Jointly processes the
-  content stream and the query stream by making them attend to the context.
-
-  Note that attention weights are computed by combining three sources of
-  information -- content, position (as in TransformerXL), and segment (to
-  model the multi-segment input to XLNet).
-  """
-  def __init__(self, hidden_size, num_heads, dropout_rate_attention):
-    """Constructor.
-
-    Args:
-      hidden_size: int scalar, the hidden size of continuous representation.
-      num_heads: int scalar, num of attention heads.
-      dropout_rate_attention: float scalar, dropout rate applied on the
-        query-to-reference attention matrix.
-    """
-    super(Attention, self).__init__()
-    self._hidden_size = hidden_size
-    self._num_heads = num_heads
-    self._dropout_rate_attention = dropout_rate_attention
-    self._size_per_head = hidden_size // num_heads
-
-    self._dense_layer_query = Projection(
-        num_heads, self._size_per_head, mode='split')
-    self._dense_layer_key_content = Projection(
-        num_heads, self._size_per_head, mode='split')
-    self._dense_layer_value = Projection(
-        num_heads, self._size_per_head, mode='split')
-    self._dense_layer_key_position = Projection(
-        num_heads, self._size_per_head, mode='split')
-    self._dense_layer_output = Projection(
-        num_heads, self._size_per_head, mode='merge')
-    self._attention_dropout_layer = tf.keras.layers.Dropout(
-        dropout_rate_attention)
-
-  def call(self,
-           content_inputs,
-           query_inputs,
-           position_encoding,
-           segment_encoding,
-           segment_matrix,
-           target_mapping,
-           content_mask,
-           query_mask,
-           content_bias,
-           position_bias,
-           segment_bias,
-           mems=None,
-           training=False):
-    """Computes new representations of content and query stream.
-
-    Args:
-      content_inputs: float tensor of shape [batch_size, q_seq_len,
-        hidden_size], input content stream.
-      query_inputs: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
-      position_encoding: float tensor of shape [batch_size, m_seq_len +
-        2 * q_seq_len, hidden_size], encodings of the relative position 
-        information.
-      segment_encoding: float tensor of shape [2, num_heads, size_per_head],
-        embedding vectors of the binary information that whether two positions
-        are from the same segment or not.
-      segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
-        q_seq_len], indicator matrix specifying if two positions are from the
-        same segment or not.
-      target_mapping: float tensor of shape [batch_size, num_targets,
-        q_seq_len], one-hot encodings of the indices of prediction targets.
-      content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the content stream.
-      query_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the query stream.
-      content_bias: float tensor of shape [num_heads, size_per_head], bias to be
-        added to the query sequences.
-      position_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      segment_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      mems: (Optional) float tensor of shape [batch_size, m_seq_len, hidden_size
-        ], encodings of the memory sequences from the previous block.
-      training: (Optional) bool scalar, True if in training mode.
-
-    Returns:
-      content_output: float tensor of shape [batch_size, q_seq_len,
-        hidden_size], output content stream.
-      query_output: float tensor of shape [batch_size, num_targets,
-        hidden_size], output query stream.
-    """
-    contexts = content_inputs if mems is None else tf.concat(
-        [mems, content_inputs], 1)
-
-    # [batch_size, m_seq_len + q_seq_len, num_heads, size_per_head]
-    key_content = self._dense_layer_key_content(contexts)
-    # [batch_size, m_seq_len + q_seq_len, num_heads, size_per_head]
-    value = self._dense_layer_value(contexts)
-    # [batch_size, m_seq_len + 2 * seq_len, num_heads, size_per_head]
-    key_position = self._dense_layer_key_position(position_encoding)
-
-    kwargs = {'key_content': key_content,
-              'value': value,
-              'key_position': key_position,
-              'segment_encoding': segment_encoding,
-              'segment_matrix': segment_matrix,
-              'content_bias': content_bias,
-              'position_bias': position_bias,
-              'segment_bias': segment_bias,
-              'training': training}
-
-    # [batch_size, q_seq_len, num_heads, size_per_head]
-    query = self._dense_layer_query(content_inputs)
-    # [batch_size, q_seq_len, num_heads, size_per_head]
-    content_outputs = self._compute_attention(
-        query, content_mask, **kwargs)
-    # [batch_size, q_seq_len, hidden_size]
-    content_outputs = self._dense_layer_output(content_outputs)
-
-
-    # [batch_size, num_targets, num_heads, size_per_head]
-    query = self._dense_layer_query(query_inputs)
-    # [batch_size, q_seq_len, num_heads, size_per_head]
-    query = tf.einsum('NPHS,NPQ->NQHS', query, target_mapping)
-    # [batch_size, q_seq_len, num_heads, size_per_head]
-    query_outputs = self._compute_attention(
-        query, query_mask, **kwargs)
-    # [batch_size, num_targets, num_heads, size_per_head]
-    query_outputs = tf.einsum('NQHS,NPQ->NPHS', query_outputs, target_mapping)
-    # [batch_size, num_targets, hidden_size]
-    query_outputs = self._dense_layer_output(query_outputs)
-
-    return content_outputs, query_outputs
-
-  def _compute_attention(self,
-                         query,
-                         token_mask,
-                         key_content,
-                         value,
-                         key_position,
-                         segment_encoding,
-                         segment_matrix,
-                         content_bias,
-                         position_bias,
-                         segment_bias,
-                         training=False):
-    """Computes attetion weights.
-
-    Args:
-      query: float tensor of shape [batch_size, q_seq_len, num_heads,
-        size_per_head], multi-headed query sequences.
-      token_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], populated with either 0 (for tokens to keep) or 1 (for
-        tokens to be masked).
-      key_content: float tensor of shape [batch_size, m_seq_len + q_seq_len,
-        num_heads, size_per_head], multi-headed content-based key sequences.
-      value: float tensor of shape [batch_size, m_seq_len + q_seq_len, num_heads
-        , size_per_head], multi-headed value sequences.
-      key_position: float tensor of shape [batch_size, m_seq_len + 2 * q_seq_len
-        , num_heads, size_per_head], multi-headed position-based key sequences.
-      segment_encoding: float tensor of shape [2, num_heads, size_per_head],
-        embedding vectors of the binary information that whether two positions
-        are from the same segment or not.
-      segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
-        q_seq_len], indicator matrix specifying if two positions are from the
-        same segment or not.
-      content_bias: float tensor of shape [num_heads, size_per_head], bias to be
-        added to the query sequences.
-      position_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      segment_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      training: (Optional) bool scalar, True if in training mode.
-
-    Returns:
-      outputs: float tensor of shape [batch_size, q_seq_len, num_heads,
-        size_per_head, the new representation of `query`.
-    """
-    # [batch_size, num_heads, q_seq_len, m_seq_len + q_seq_len]
-    content_attention = tf.einsum('NQHS,NRHS->NHQR',
-                                  query + content_bias,
-                                  key_content)
-
-    # [batch_size, num_heads, q_seq_len, m_seq_len + 2 * q_seq_len]
-    position_attention = tf.einsum('NQHS,NRHS->NHQR',
-                                   query + position_bias,
-                                   key_position)
-
-    # [batch_size, num_heads, q_seq_len, m_seq_len + q_seq_len]
-    position_attention = rel_shift(position_attention)[
-        ..., 1:1 + tf.shape(content_attention)[3]]
-    
-    # [batch_size, num_heads, q_seq_len, 2]
-    segment_attention = tf.einsum('NQHS,GHS->NHQG',
-                                  query + segment_bias,
-                                  segment_encoding)
-
-    attention_shape = tf.shape(content_attention)
-
-    # [batch_size, num_heads, q_seq_len, m_seq_len + q_seq_len]
-    segment_attention = tf.where(
-        tf.broadcast_to(segment_matrix[:, tf.newaxis], attention_shape),
-        tf.broadcast_to(segment_attention[..., 1:], attention_shape),
-        tf.broadcast_to(segment_attention[..., :1], attention_shape))
-
-    attention_weights = tf.multiply(
-        content_attention + position_attention + segment_attention,
-        1.0 / math.sqrt(float(self._size_per_head)))
-
-    attention_weights += token_mask * NEG_INF
-    attention_weights = tf.nn.softmax(attention_weights, axis=3)
-    attention_weights = self._attention_dropout_layer(
-        attention_weights, training=training)
-
-    outputs = tf.einsum('NHQR,NRHS->NQHS', attention_weights, value)
-    return outputs
+from utils import compute_attention_mask
+from utils import compute_position_encoding 
+from utils import compute_segment_matrix 
+from utils import cache_memory 
+from utils import get_position_encoding
 
 
 class DecoderLayer(tf.keras.layers.Layer):
   """The building block that makes the decoder stack of layers, consisting of a 
-  self-attention sublayer and a feed-forward sublayer. Processes content stream
-  and query stream separately.
+  self-attention sublayer and a feed-forward sublayer. Takes content stream (and
+  optionally query stream) as input sequences.
   """
   def __init__(self,
                hidden_size,
                num_heads,
                filter_size,
                dropout_rate,
-               dropout_rate_attention):
+               dropout_rate_attention,
+               filter_activation=tf.nn.relu):
     """Constructor.
 
     Args:
@@ -268,6 +32,8 @@ class DecoderLayer(tf.keras.layers.Layer):
       dropout_rate: float scalar, dropout rate for the Dropout layers.
       dropout_rate_attention: float scalar, dropout rate applied on the
         query-to-reference attention matrix.
+      filter_activation: callable or string, activation function of the filter
+        dense layer. Defaults to ReLU.
     """
     super(DecoderLayer, self).__init__()
     self._hidden_size = hidden_size
@@ -275,88 +41,98 @@ class DecoderLayer(tf.keras.layers.Layer):
     self._filter_size = filter_size
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
+    self._filter_activation = filter_activation
 
-    self._mha = Attention(
-        hidden_size, num_heads, dropout_rate_attention)
+    self._mha = RelativeAttention(
+        hidden_size, num_heads, dropout_rate_attention, for_xlnet=True)
     self._layernorm_mha = tf.keras.layers.LayerNormalization(epsilon=1e-12)
     self._dropout_mha = tf.keras.layers.Dropout(dropout_rate)
 
-    self._ffn = FeedForwardNetwork(hidden_size, filter_size, dropout_rate)
+    self._ffn = FeedForwardNetwork(
+        hidden_size, filter_size, dropout_rate, filter_activation)
     self._layernorm_ffn = tf.keras.layers.LayerNormalization(epsilon=1e-12)
     self._dropout_ffn = tf.keras.layers.Dropout(dropout_rate)
 
-  def call(self, 
-           content_inputs,
-           query_inputs,
-           position_encoding,
-           segment_encoding,
-           segment_matrix,
-           target_mapping,
+  def call(self,
+           content_stream,
            content_mask,
-           query_mask,
+           context,
+           position_encoding,
            content_bias,
            position_bias,
+           segment_encoding,
+           segment_matrix,
            segment_bias,
-           mems=None,
+           query_stream=None,
+           query_mask=None,
+           target_mapping=None,
            training=False):
     """Computes the output of the decoder layer.
 
     Args:
-      content_inputs: float tensor of shape [batch_size, q_seq_len,
-        hidden_size], input content stream.
-      query_inputs: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
-      position_encoding: float tensor of shape [batch_size, m_seq_len +
-        2 * q_seq_len, hidden_size], encodings of the relative position 
-        information.
+      content_stream: float tensor of shape [batch_size, q_seq_len, hidden_size]
+        , the query sequences for TransformerXL or the content stream for 
+        pre-training XLNet.
+      content_mask: float tensor of shape [batch_size, 1, q_seq_len, c_seq_len],
+        token mask for content stream. 
+      context: float tensor of shape [batch_size, c_seq_len, hidden_size], the
+        context sequences to which the query sequences will attend. 
+      position_encoding: float tensor of shape [batch_size, r_seq_len,
+        hidden_size], the position encoding for the context sequences.
+      content_bias: float tensor of shape [num_heads, size_per_head], content
+        bias.
+      position_bias: float tensor of shape [num_heads, size_per_head], position
+        bias.
       segment_encoding: float tensor of shape [2, num_heads, size_per_head],
         embedding vectors of the binary information that whether two positions
         are from the same segment or not.
-      segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
-        q_seq_len], indicator matrix specifying if two positions are from the
-        same segment or not.
-      target_mapping: float tensor of shape [batch_size, num_targets,
-        q_seq_len], one-hot encodings of the indices of prediction targets.
-      content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the content stream.
-      query_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the query stream.
-      content_bias: float tensor of shape [num_heads, size_per_head], bias to be
-        added to the query sequences.
-      position_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      segment_bias: float tensor of shape [num_heads, size_per_head], bias to
-        be added to the query sequences.
-      mems: (Optional) float tensor of shape [batch_size, m_seq_len, hidden_size
-        ], encodings of the memory sequences from the previous block.
+      segment_matrix: bool tensor of shape [batch_size, q_seq_len, c_seq_len],
+        binary matrix indicating whether two positions are from the same segment
+        or not.
+      segment_bias: float tensor of shape [num_heads, size_per_head], segment
+        bias.
+      query_stream: (Optional) float tensor of shape [batch_size,
+        num_predictions, hidden_size], the query stream for pre-training XLNet. 
+      query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
+        c_seq_len], token mask for query stream.
+      target_mapping: (Optional) float tensor of shape [batch_size,
+        num_predictions, hidden_size], one-hot encodings of the indices of
+        prediction targets. 
       training: (Optional) bool scalar, True if in training mode.
 
     Returns:
-      content_output: float tensor of shape [batch_size, q_seq_len,
-        hidden_size], output content stream.
-      query_output: float tensor of shape [batch_size, num_targets,
-        hidden_size], output query stream.
+      outputs: float tensor of shape [batch_size, q_seq_len, hidden_size], for
+        single stream input; or a tuple of two tensors of shape [batch_size,
+        q_seq_len, hidden_size] and [batch_size, num_targets, hidden_size].
     """
-    content_outputs, query_outputs = self._mha(content_inputs,
-                                               query_inputs,
-                                               position_encoding,
-                                               segment_encoding,
-                                               segment_matrix,
-                                               target_mapping,
-                                               content_mask,
-                                               query_mask,
-                                               content_bias,
-                                               position_bias,
-                                               segment_bias,
-                                               mems=mems,
-                                               training=training)
+    kwargs = {'content_stream': content_stream,
+              'content_mask': content_mask,
+              'context': context,
+              'position_encoding': position_encoding,
+              'content_bias': content_bias,
+              'position_bias': position_bias,
+              'segment_encoding': segment_encoding,
+              'segment_matrix': segment_matrix,
+              'segment_bias': segment_bias,
+              'query_stream': query_stream,
+              'query_mask': query_mask,
+              'target_mapping': target_mapping,
+              'training': training}
 
-    content_outputs = self._process_stream(
-        content_inputs, content_outputs, training=training)
-    query_outputs = self._process_stream(
-        query_inputs, query_outputs, training=training)
+    if query_stream is not None:
+      content_outputs, query_outputs = self._mha(**kwargs)
+      content_outputs = self._process_stream(
+          content_stream, content_outputs, training=training)
+      query_outputs = self._process_stream(
+          query_stream, query_outputs, training=training)
 
-    return content_outputs, query_outputs
+      return content_outputs, query_outputs
+    else:
+      content_outputs = self._mha(**kwargs)
+      content_outputs = self._process_stream(
+          content_stream, content_outputs, training=training) 
+
+      return content_outputs
 
   def _process_stream(self, inputs, outputs, training=False):
     """Processes the results of attention computation of each stream (content or
@@ -375,15 +151,16 @@ class DecoderLayer(tf.keras.layers.Layer):
     """
     outputs = self._dropout_mha(outputs, training=training)
     ffn_inputs = self._layernorm_mha(outputs + inputs)
-
     outputs = self._ffn(ffn_inputs, training=training)
     outputs = self._dropout_ffn(outputs, training=training)
     outputs = self._layernorm_ffn(outputs + ffn_inputs)
-    return outputs 
+    return outputs
 
 
 class TransformerXLModel(tf.keras.layers.Layer):
-  """TransformerXL adapted to process two-stream inputs."""
+  """TransformerXL adapted to optionally process query stream in addition to
+  content stram.
+  """
   def __init__(self,
                vocab_size,
                stack_size=6,
@@ -394,7 +171,8 @@ class TransformerXLModel(tf.keras.layers.Layer):
                reuse_len=256,
                dropout_rate=0.1,
                dropout_rate_attention=0.0,
-               tie_biases=True):
+               tie_biases=True,
+               filter_activation=tf.nn.relu):
     """Constructor.
 
     Args:
@@ -412,6 +190,8 @@ class TransformerXLModel(tf.keras.layers.Layer):
       tie_biases: bool scalar, whether to force all layers use the same
         content bias and position bias (True), or create the biases for each
         layer (False).
+      two_steram: bool scalar, whether to apply multi-headed attention with both
+        content and query stream (True), or just content stream (False).
     """
     super(TransformerXLModel, self).__init__()
     self._vocab_size = vocab_size
@@ -431,7 +211,8 @@ class TransformerXLModel(tf.keras.layers.Layer):
                                       num_heads,
                                       filter_size,
                                       dropout_rate,
-                                      dropout_rate_attention))
+                                      dropout_rate_attention,
+                                      filter_activation))
 
   def build(self, inputs_shape):
     """Creates weights of this layer.
@@ -473,14 +254,14 @@ class TransformerXLModel(tf.keras.layers.Layer):
 
   def call(self,
            content_stream,
-           query_stream,
+           content_mask,
            position_encoding,
            segment_encoding,
            segment_matrix,
-           target_mapping,
-           content_mask,
-           query_mask,
+           query_stream=None,
+           query_mask=None,
            mems=None,
+           target_mapping=None,
            training=False):
     """Computes query stream output and updates the memory.
 
@@ -514,131 +295,48 @@ class TransformerXLModel(tf.keras.layers.Layer):
         hidden_size], input query stream.      
       new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
         hidden_size], updated memories.
-    """   
-    new_mems = []
+    """
+    new_mems = [] 
     mems = [None] * self._stack_size if mems is None else tf.unstack(
         mems, axis=1)
 
     for i in range(self._stack_size):
       new_mems.append(cache_memory(
           content_stream, mems[i], self._mem_len, self._reuse_len))
-
       if self._tie_biases:
-        content_bias = self._content_bias
-        position_bias = self._position_bias
-        segment_bias = self._segment_bias
+        content_bias, position_bias, segment_bias = (self._content_bias,
+                                                     self._position_bias,
+                                                     self._segment_bias)
       else:
-        content_bias = self._content_bias[i]
-        position_bias = self._position_bias[i]
-        segment_bias = self._segment_bias[i]
-
-      content_stream, query_stream = self._stack[i](
+        content_bias, position_bias, segment_bias = (self._content_bias[i],
+                                                     self._position_bias[i],
+                                                     self._segment_bias[i]) 
+      outputs = self._stack[i](
           content_stream,
-          query_stream,
-          position_encoding,
-          segment_encoding[i],
-          segment_matrix,
-          target_mapping,
           content_mask,
-          query_mask,
+          content_stream if mems[i] is None else tf.concat(
+            [mems[i], content_stream], 1),
+          position_encoding,
           content_bias,
           position_bias,
+          segment_encoding[i],
+          segment_matrix,
           segment_bias,
-          mems=mems[i],
+          query_stream=query_stream,
+          query_mask=query_mask,
+          target_mapping=target_mapping,
           training=training)
-    new_mems = tf.stack(new_mems, axis=1)
-    return query_stream, new_mems
 
+      if query_stream is None:
+        content_stream = outputs
+      else:
+        content_stream, query_stream = outputs
 
-def _compute_attention_mask(perm_mask, m_seq_len, q_seq_len):
-  """Compute attention mask for content stream and query stream.
-
-  Args:
-    perm_mask: float tensor of shape [batch_size, q_seq_len, q_seq_len]
-    m_seq_len: int scalar tensor, memory sequence length.
-    q_seq_len: int scalar tensor, query sequence length.
-
-  Returns:
-    content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-      q_seq_len], token mask for content stream.
-    query_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-      q_seq_len], token mask for query stream.
-  """
-  content_mask = tf.pad(perm_mask * (1 - tf.eye(q_seq_len)), 
-      [[0, 0], [0, 0], [m_seq_len, 0]])
-  content_mask = content_mask[:, tf.newaxis]
-
-  query_mask = tf.pad(perm_mask,
-      [[0, 0], [0, 0], [m_seq_len, 0]])
-  query_mask = query_mask[:, tf.newaxis]
-
-  return content_mask, query_mask
-
-
-def _compute_position_encoding(hidden_size, batch_size, m_seq_len, q_seq_len):
-  """Computes position encoding matrix.
-
-  Args:
-    hidden_size: int scalar, the hidden size of continuous representation.
-    batch_size: int scalar tensor, batch size.
-    m_seq_len: int scalar tensor, memory sequence length.
-    q_seq_len: int scalar tensor, query sequence length.
-
-  Returns:
-    relative_position_encoding: float tensor of shape [batch_size, m_seq_len +
-      2 * q_seq_len, hidden_size], the tensor that encodes position 
-      information.
-  """
-  fw_pos_seq = tf.range(m_seq_len + q_seq_len, -q_seq_len, -1.0)
-  bw_pos_seq = tf.range(-m_seq_len - q_seq_len, q_seq_len, 1.0)
-
-  fw_position_encoding = get_position_encoding(fw_pos_seq, hidden_size)
-  bw_position_encoding = get_position_encoding(bw_pos_seq, hidden_size)
-  fw_position_encoding = tf.tile(fw_position_encoding[tf.newaxis],
-                                   [batch_size // 2, 1, 1])
-  bw_position_encoding = tf.tile(bw_position_encoding[tf.newaxis],
-                                   [batch_size // 2, 1, 1])
-  relative_position_encoding = tf.concat(
-      [fw_position_encoding, bw_position_encoding], axis=0)
-  return relative_position_encoding
-
-
-def _compute_segment_matrix(segment_ids, m_seq_len):
-  """Computes the binary matrix indicating whether two positions are from the
-  same segment or not.
-
-  Args:
-    segment_ids: int tensor of shape [batch_size, q_seq_len], integer matrix
-      populated with 0, 1, or 2, where 0 and 1 indicates the corresponding
-      position is from the first and the second segment, respectively; and 2
-      represents the special token `CLS`.
-    m_seq_len: int scalar, memory sequence length.
-
-  Returns:
-    segment_matrix: bool tensor of shape [batch_size, q_seq_len, m_seq_len +
-      q_seq_len], binary matrix indicating whether two positions are from the
-      same segment or not.
-  """
-  reference_segment_ids = tf.pad(segment_ids, [[0, 0], [m_seq_len, 0]])
-
-  class_index_matrix = tf.logical_or(
-      (segment_ids == SEG_ID_CLS)[..., tf.newaxis],
-      (reference_segment_ids == SEG_ID_CLS)[:, tf.newaxis])
-
-  segment_matrix = (segment_ids[..., tf.newaxis] == 
-                    reference_segment_ids[:, tf.newaxis])
-
-  segment_matrix = tf.logical_or(class_index_matrix, segment_matrix)
-  return segment_matrix
-
-
-def get_position_encoding(pos_seq, hidden_size):
-  inverse_frequencies = 1 / (10000 ** (tf.range(0, hidden_size, 2.0) /
-      hidden_size))
-  position_encoding = tf.einsum('i,j->ij', pos_seq, inverse_frequencies)
-  position_encoding = tf.concat([tf.sin(position_encoding),
-                                   tf.cos(position_encoding)], axis=1)
-  return position_encoding
+    if query_stream is None: 
+      return content_stream
+    else:
+      new_mems = tf.stack(new_mems, axis=1)
+      return query_stream, new_mems
 
 
 class XLNetModel(tf.keras.layers.Layer):
@@ -655,7 +353,9 @@ class XLNetModel(tf.keras.layers.Layer):
                reuse_len=256,
                dropout_rate=0.1,
                dropout_rate_attention=0.0, 
-               tie_biases=False):
+               tie_biases=False,
+               use_cls_mask=True,
+               uni_data=False):
     """Constructor.
 
     Args:
@@ -686,6 +386,8 @@ class XLNetModel(tf.keras.layers.Layer):
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
+    self._use_cls_mask = use_cls_mask
+    self._uni_data = uni_data
 
     self._size_per_head = hidden_size // num_heads
 
@@ -762,27 +464,28 @@ class XLNetModel(tf.keras.layers.Layer):
     q_seq_len = tf.shape(inputs)[1]
     m_seq_len = 0 if mems is None else tf.shape(mems[0])[1]
 
-    content_mask, query_mask = _compute_attention_mask(
+    content_mask, query_mask = compute_attention_mask(
         perm_mask, m_seq_len, q_seq_len)
-    relative_position_encoding = self._dropout_layer(
-        _compute_position_encoding(
-            self._hidden_size, batch_size, m_seq_len, q_seq_len))
-    segment_matrix = _compute_segment_matrix(segment_ids, m_seq_len)
+    relative_position_encoding = self._dropout_layer(compute_position_encoding(
+        self._hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data))
+    segment_matrix = compute_segment_matrix(
+        segment_ids, m_seq_len, self._use_cls_mask)
 
     content_stream = self._dropout_layer(self._embedding_layer(inputs))
 
     query_stream = self._dropout_layer(tf.tile(self._mask_embedding,
         [batch_size, tf.shape(target_mapping)[1], 1]))
+
     query_stream, new_mems = self._transformer_xl(
         content_stream,
-        query_stream,
+        content_mask,
         relative_position_encoding,
         self._segment_embedding,
         segment_matrix,
-        target_mapping,
-        content_mask,
+        query_stream,
         query_mask,
-        mems=mems)
+        mems,
+        target_mapping)
 
     return query_stream, new_mems
 
@@ -838,3 +541,105 @@ class PretrainLogits(tf.keras.layers.Layer):
         ) + self._bias_output
     return logits
 
+
+class QuestionAnwserLogits(tf.keras.layers.Layer):
+  def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate):
+    super(QuestionAnwserLogits, self).__init__()
+    self._hidden_size = hidden_size
+    self._start_n_top = start_n_top
+    self._end_n_top = end_n_top
+    self._dropout_rate = dropout_rate
+
+  def build(self, inputs_shape):
+    """Implements build() for the layer."""
+    self.start_logits_proj_layer = tf.keras.layers.Dense(
+        units=1, kernel_initializer=None, name="start_logits/dense")
+    self.end_logits_proj_layer0 = tf.keras.layers.Dense(
+        units=self._hidden_size,
+        kernel_initializer=None,
+        activation=tf.nn.tanh,
+        name="end_logits/dense_0")
+    self.end_logits_proj_layer1 = tf.keras.layers.Dense(
+        units=1, kernel_initializer=None, name="end_logits/dense_1")
+    self.end_logits_layer_norm = tf.keras.layers.LayerNormalization(
+        axis=-1, epsilon=1e-12, name="end_logits/LayerNorm")
+    self.answer_class_proj_layer0 = tf.keras.layers.Dense(
+        units=self._hidden_size,
+        kernel_initializer=None,
+        activation=tf.nn.tanh,
+        name="answer_class/dense_0")
+    self.answer_class_proj_layer1 = tf.keras.layers.Dense(
+        units=1,
+        kernel_initializer=None,
+        use_bias=False,
+        name="answer_class/dense_1")
+    self.ans_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
+    super(QuestionAnwserLogits, self).build(inputs_shape)
+    
+
+  def call(self, inputs, p_mask, cls_index, start_positions=None, end_positions=None, is_impossible=None, training=True):
+    return_dict = {}
+    seq_len = tf.shape(inputs)[1]  
+    inputs = tf.transpose(inputs, [1, 0, 2])
+    start_logits = self.start_logits_proj_layer(inputs)
+    start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
+    start_logits_masked = start_logits * (1 - p_mask) - 1e30 * p_mask
+    start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
+    if training:
+      start_positions = tf.reshape(start_positions, [-1])
+      start_index = tf.one_hot(
+          start_positions, depth=seq_len, axis=-1, dtype=tf.float32)
+      start_features = tf.einsum("lbh,bl->bh", inputs, start_index)
+      start_features = tf.tile(start_features[None], [seq_len, 1, 1])
+      end_logits = self.end_logits_proj_layer0(
+          tf.concat([inputs, start_features], axis=-1))
+      
+      end_logits = self.end_logits_layer_norm(end_logits)
+
+      end_logits = self.end_logits_proj_layer1(end_logits)
+      end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
+      end_logits_masked = end_logits * (1 - p_mask) - 1e30 * p_mask
+      end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
+    else:
+      pass
+
+    if training:
+      return_dict["start_log_probs"] = start_log_probs
+      return_dict["end_log_probs"] = end_log_probs
+    else:
+      pass
+
+    # get the representation of CLS
+    cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype=tf.float32)
+    cls_feature = tf.einsum("lbh,bl->bh", inputs, cls_index)
+
+    # get the representation of START
+    start_p = tf.nn.softmax(start_logits_masked, axis=-1, name="softmax_start")
+    start_feature = tf.einsum("lbh,bl->bh", inputs, start_p)
+
+    ans_feature = tf.concat([start_feature, cls_feature], -1)
+    ans_feature = self.answer_class_proj_layer0(ans_feature)
+    ans_feature = self.ans_feature_dropout(ans_feature)
+    cls_logits = self.answer_class_proj_layer1(ans_feature)
+    cls_logits = tf.squeeze(cls_logits, -1)
+    return_dict["cls_logits"] = cls_logits
+
+    def compute_loss(log_probs, positions):
+      one_hot_positions = tf.one_hot(positions, depth=seq_len, dtype=tf.float32)
+
+      loss = -tf.reduce_sum(one_hot_positions * log_probs, axis=-1)
+      loss = tf.reduce_mean(loss)
+      return loss
+
+    start_loss = compute_loss(start_log_probs, start_positions)
+    end_loss = compute_loss(end_log_probs, end_positions)
+
+    total_loss = (start_loss + end_loss) * 0.5
+
+    is_impossible = tf.reshape(is_impossible, [-1])
+    regression_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=is_impossible, logits=cls_logits)
+    regression_loss = tf.reduce_mean(regression_loss)
+
+    total_loss += regression_loss * 0.5
+    return total_loss, cls_logits
