@@ -131,7 +131,6 @@ class DecoderLayer(tf.keras.layers.Layer):
       content_outputs = self._mha(**kwargs)
       content_outputs = self._process_stream(
           content_stream, content_outputs, training=training) 
-
       return content_outputs
 
   def _process_stream(self, inputs, outputs, training=False):
@@ -354,8 +353,9 @@ class XLNetModel(tf.keras.layers.Layer):
                dropout_rate=0.1,
                dropout_rate_attention=0.0, 
                tie_biases=False,
-               use_cls_mask=True,
-               uni_data=False):
+               two_stream=True,
+               uni_data=False,
+               filter_activation=tf.nn.relu):
     """Constructor.
 
     Args:
@@ -386,8 +386,9 @@ class XLNetModel(tf.keras.layers.Layer):
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
-    self._use_cls_mask = use_cls_mask
+    self._two_stream = two_stream
     self._uni_data = uni_data
+    self._filter_activation = filter_activation
 
     self._size_per_head = hidden_size // num_heads
 
@@ -404,7 +405,8 @@ class XLNetModel(tf.keras.layers.Layer):
                reuse_len=reuse_len,
                dropout_rate=dropout_rate,
                dropout_rate_attention=dropout_rate_attention,
-               tie_biases=tie_biases)
+               tie_biases=tie_biases,
+               filter_activation=filter_activation)
 
   def build(self, inputs_shape):
     """Creates weights of this layer.
@@ -420,21 +422,21 @@ class XLNetModel(tf.keras.layers.Layer):
             dtype='float32',
             trainable=True)
 
-    self._mask_embedding = self.add_weight(
-            'mask_embedding',
-            shape=[1, 1, self._hidden_size],
-            initializer=tf.keras.initializers.RandomNormal(
-                mean=0., stddev=self._hidden_size ** -0.5),
-            dtype='float32',
-            trainable=True)
+    if self._two_stream:
+      self._mask_embedding = self.add_weight(
+              'mask_embedding',
+              shape=[1, 1, self._hidden_size],
+              initializer=tf.keras.initializers.RandomNormal(
+                  mean=0., stddev=self._hidden_size ** -0.5),
+              dtype='float32',
+              trainable=True)
     super(XLNetModel, self).build(inputs_shape)
 
   def call(self, 
            inputs,
            segment_ids,
            perm_mask,
-           target_mapping,
-           masked_tokens,
+           target_mapping=None,
            mems=None):
     """Computes the output query stream and update the memories.
 
@@ -448,8 +450,6 @@ class XLNetModel(tf.keras.layers.Layer):
         matrix where 1 means the corresponding position cannot be attended to.
       target_mapping: float tensor of shape [batch_size, num_targets,
         q_seq_len], one-hot encodings of the indices of prediction targets.
-      masked_tokens: bool tensor of shape [batch_size, q_seq_len], binary matrix
-        where 1 means the corresponding position is the prediction target. 
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
         block.
@@ -469,14 +469,18 @@ class XLNetModel(tf.keras.layers.Layer):
     relative_position_encoding = self._dropout_layer(compute_position_encoding(
         self._hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data))
     segment_matrix = compute_segment_matrix(
-        segment_ids, m_seq_len, self._use_cls_mask)
+        segment_ids, m_seq_len, self._two_stream)
 
     content_stream = self._dropout_layer(self._embedding_layer(inputs))
 
-    query_stream = self._dropout_layer(tf.tile(self._mask_embedding,
-        [batch_size, tf.shape(target_mapping)[1], 1]))
+    if self._two_stream:
+      query_stream = self._dropout_layer(tf.tile(self._mask_embedding,
+          [batch_size, tf.shape(target_mapping)[1], 1]))
+    else:
+      query_stream = None
 
-    query_stream, new_mems = self._transformer_xl(
+    #query_stream, new_mems
+    outputs = self._transformer_xl(
         content_stream,
         content_mask,
         relative_position_encoding,
@@ -487,7 +491,8 @@ class XLNetModel(tf.keras.layers.Layer):
         mems,
         target_mapping)
 
-    return query_stream, new_mems
+
+    return outputs
 
 
 class PretrainLogits(tf.keras.layers.Layer):
