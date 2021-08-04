@@ -24,7 +24,7 @@ def cache_memory(inputs, memory=None, mem_len=0, reuse_len=0):
   if memory is None:
     new_memory = inputs[:, -mem_len:]
   else:
-    new_memory = tf.concat([memory, inputs[:, :reuse_len]], 1)[:, -mem_len:]
+    new_memory = tf.concat([memory, inputs], 1)[:, -mem_len:]
   return tf.stop_gradient(new_memory)
 
 
