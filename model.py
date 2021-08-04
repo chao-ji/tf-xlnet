@@ -32,8 +32,8 @@ class DecoderLayer(tf.keras.layers.Layer):
       dropout_rate: float scalar, dropout rate for the Dropout layers.
       dropout_rate_attention: float scalar, dropout rate applied on the
         query-to-reference attention matrix.
-      filter_activation: callable or string, activation function of the filter
-        dense layer. Defaults to ReLU.
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
     """
     super(DecoderLayer, self).__init__()
     self._hidden_size = hidden_size
@@ -176,21 +176,24 @@ class TransformerXLModel(tf.keras.layers.Layer):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      stack_size: int scalar, num of layers in the decoder stack.
-      hidden_size: int scalar, the hidden size of continuous representation.
-      num_heads: int scalar, num of attention heads.
-      filter_size: int scalar, the depth of the intermediate dense layer of the
-        feed-forward sublayer.
-      mem_len: int scalar, num tokens to be cacched.
-      reuse_len: int scalar, num of tokens to be reused in the next batch. 
-      dropout_rate: float scalar, dropout rate for the Dropout layers.   
-      dropout_rate_attention: float scalar, dropout rate applied on the 
-        query-to-reference attention matrix. 
-      tie_biases: bool scalar, whether to force all layers use the same
-        content bias and position bias (True), or create the biases for each
-        layer (False).
-      two_steram: bool scalar, whether to apply multi-headed attention with both
-        content and query stream (True), or just content stream (False).
+      stack_size: (Optional) int scalar, num of layers in the decoder stack.
+      hidden_size: (Optional) int scalar, the hidden size of continuous
+        representation.
+      num_heads: (Optional) int scalar, num of attention heads.
+      filter_size: (Optional) int scalar, the depth of the intermediate dense
+        layer of the feed-forward sublayer.
+      mem_len: (Optional) int scalar, num tokens to be cached.
+      reuse_len: (Optional) int scalar, num of tokens to be reused in the next
+        batch. 
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix. 
+      tie_biases: (Optional) bool scalar, whether to force all layers use the
+        same content bias and position bias (True), or create the biases for
+        each layer (False).
+      two_steram: (Optional) bool scalar, whether to apply multi-headed
+        attention with both content and query stream (True), or just content
+        stream (False).
     """
     super(TransformerXLModel, self).__init__()
     self._vocab_size = vocab_size
@@ -203,6 +206,8 @@ class TransformerXLModel(tf.keras.layers.Layer):
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
+
+    self._size_per_head = hidden_size // num_heads
 
     self._stack = []
     for i in range(self._stack_size):
@@ -249,13 +254,20 @@ class TransformerXLModel(tf.keras.layers.Layer):
         shape=bias_shape,
         dtype='float32',
         trainable=True)
+
+    self._segment_encoding = self.add_weight(
+            'segment_encoding',
+            shape=[self._stack_size, 2, self._num_heads, self._size_per_head],
+            initializer=tf.keras.initializers.RandomNormal(
+                mean=0., stddev=self._hidden_size ** -0.5),
+            dtype='float32',
+            trainable=True)
     super(TransformerXLModel, self).build(inputs_shape)
 
   def call(self,
            content_stream,
            content_mask,
            position_encoding,
-           segment_encoding,
            segment_matrix,
            query_stream=None,
            query_mask=None,
@@ -267,33 +279,31 @@ class TransformerXLModel(tf.keras.layers.Layer):
     Args:
       content_stream: float tensor of shape [batch_size, q_seq_len,
         hidden_size], input content stream.
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
+      content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
+        q_seq_len], permutation mask for the content stream.
       position_encoding: float tensor of shape [batch_size, m_seq_len +
         2 * q_seq_len, hidden_size], encodings of the relative position 
         information.
-      segment_encoding: float tensor of shape [stack_size, 2, num_heads,
-        size_per_head], embedding vectors of the binary information that
-        whether two positions are from the same segment or not.      
       segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
         q_seq_len], indicator matrix specifying if two positions are from the
         same segment or not.
-      target_mapping: float tensor of shape [batch_size, num_targets,
-        q_seq_len], one-hot encodings of the indices of prediction targets.
-      content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the content stream.
-      query_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
-        q_seq_len], permutation mask for the query stream.
+      query_stream: (Optional) float tensor of shape [batch_size, num_targets,
+        hidden_size], input query stream.
+      query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
+        m_seq_len + q_seq_len], permutation mask for the query stream.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
         block.
+      target_mapping: (Optional) float tensor of shape [batch_size, num_targets,
+        q_seq_len], one-hot encodings of the indices of prediction targets.
       training: (Optional) bool scalar, True if in training mode.
  
     Returns:
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.      
-      new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
-        hidden_size], updated memories.
+      outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
+        query stream in new representation, if `two_stream` is False; Or, a 
+        tuple of two float tensors of shape [batch_size, num_targets,
+        hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
+        output query stream and updated memory, if `two_stream` is True.
     """
     new_mems = [] 
     mems = [None] * self._stack_size if mems is None else tf.unstack(
@@ -309,7 +319,9 @@ class TransformerXLModel(tf.keras.layers.Layer):
       else:
         content_bias, position_bias, segment_bias = (self._content_bias[i],
                                                      self._position_bias[i],
-                                                     self._segment_bias[i]) 
+                                                     self._segment_bias[i])
+      segment_encoding = self._segment_encoding
+
       outputs = self._stack[i](
           content_stream,
           content_mask,
@@ -343,7 +355,7 @@ class XLNetModel(tf.keras.layers.Layer):
   https://arxiv.org/abs/1906.08237
   """
   def __init__(self,
-               vocab_size=32000,
+               vocab_size,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
@@ -359,20 +371,28 @@ class XLNetModel(tf.keras.layers.Layer):
     """Constructor.
 
     Args:
-      vocab_size: int scalar, vocabulary size.
-      stack_size: int scalar, num of layers in the decoder stack.
-      hidden_size: int scalar, the hidden size of continuous representation.
-      num_heads: int scalar, num of attention heads.
-      filter_size: int scalar, the depth of the intermediate dense layer of the
-        feed-forward sublayer.
-      mem_len: int scalar, num tokens to be cacched.
-      reuse_len: int scalar, num of tokens to be reused in the next batch.
-      dropout_rate: float scalar, dropout rate for the Dropout layers.   
-      dropout_rate_attention: float scalar, dropout rate applied on the 
-        query-to-reference attention matrix. 
+      vocab_size: (Optional) int scalar, vocabulary size.
+      stack_size: (Optional) int scalar, num of layers in the decoder stack.
+      hidden_size: (Optional) int scalar, the hidden size of continuous
+        representation.
+      num_heads: (Optional) int scalar, num of attention heads.
+      filter_size: (Optional) int scalar, the depth of the intermediate dense
+        layer of the feed-forward sublayer.
+      mem_len: (Optional) int scalar, num tokens to be cacched.
+      reuse_len: (Optional) int scalar, num of tokens to be reused in the next
+        batch.
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix. 
       tie_biases: bool scalar, whether to force all layers use the same
         content, position and segment bias (True), or create the biases for each
-        layer (False).             
+        layer (False).
+      two_stream: (Optional) bool scalar, whether to process both content and
+        query stream (True) or just content stream (False).
+      uni_data: (Optional) bool scalar, whether the data is unidirectional or
+        bidirectional. Defaults to False.
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
     """
     super(XLNetModel, self).__init__()
 
@@ -414,14 +434,6 @@ class XLNetModel(tf.keras.layers.Layer):
     Args:
       inputs_shape: tuple of ints or 1-D int tensor. Not used.
     """
-    self._segment_embedding = self.add_weight(
-            'segment_embedding',
-            shape=[self._stack_size, 2, self._num_heads, self._size_per_head],
-            initializer=tf.keras.initializers.RandomNormal(
-                mean=0., stddev=self._hidden_size ** -0.5),
-            dtype='float32',
-            trainable=True)
-
     if self._two_stream:
       self._mask_embedding = self.add_weight(
               'mask_embedding',
@@ -448,17 +460,18 @@ class XLNetModel(tf.keras.layers.Layer):
         is from the first and second sequence segment, or is the `CLS` token.
       perm_mask: int tensor of shape [batch_size, q_seq_len, q_seq_len], binary
         matrix where 1 means the corresponding position cannot be attended to.
-      target_mapping: float tensor of shape [batch_size, num_targets,
+      target_mapping: (Optional) float tensor of shape [batch_size, num_targets,
         q_seq_len], one-hot encodings of the indices of prediction targets.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
         block.
 
     Returns:
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
-      new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
-        hidden_size], updated memories.
+      outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
+        query stream in new representation, if `two_stream` is False; Or, a 
+        tuple of two float tensors of shape [batch_size, num_targets,
+        hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
+        output query stream and updated memory, if `two_stream` is True.
     """
     batch_size = tf.shape(inputs)[0]
     q_seq_len = tf.shape(inputs)[1]
@@ -479,18 +492,15 @@ class XLNetModel(tf.keras.layers.Layer):
     else:
       query_stream = None
 
-    #query_stream, new_mems
     outputs = self._transformer_xl(
         content_stream,
         content_mask,
         relative_position_encoding,
-        self._segment_embedding,
         segment_matrix,
         query_stream,
         query_mask,
         mems,
         target_mapping)
-
 
     return outputs
 
