@@ -1,5 +1,6 @@
 """Defines XLNet model in tf.keras.API."""
 import tensorflow as tf
+
 from commons.layers import FeedForwardNetwork
 from commons.layers import RelativeAttention
 
@@ -476,9 +477,9 @@ class XLNetModel(tf.keras.layers.Layer):
     batch_size = tf.shape(inputs)[0]
     q_seq_len = tf.shape(inputs)[1]
     m_seq_len = 0 if mems is None else tf.shape(mems[0])[1]
-
     content_mask, query_mask = compute_attention_mask(
         perm_mask, m_seq_len, q_seq_len)
+
     relative_position_encoding = self._dropout_layer(compute_position_encoding(
         self._hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data))
     segment_matrix = compute_segment_matrix(
@@ -590,9 +591,25 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
         name="answer_class/dense_1")
     self.ans_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
     super(QuestionAnwserLogits, self).build(inputs_shape)
-    
 
-  def call(self, inputs, p_mask, cls_index, start_positions=None, end_positions=None, is_impossible=None, training=True):
+  def call(self,
+           inputs,
+           p_mask,
+           cls_index,
+           start_positions=None,
+           end_positions=None,
+           is_impossible=None,
+           training=True):
+    """
+    Args:
+      inputs: float tensor of shape [batch_size, seq_len, hidden_size]
+      p_mask: float tensor of shape [batch_size, seq_len], binary values
+      cls_index: int tensor of shape [batch_size], indices of the CLS token in
+        `inputs`.
+      start_positions: int tensor of shape [batch_size],
+      end_positions: int tensor of shape [batch_size],
+      is_impossible: float tensor of shape [batch_size], binary values
+    """
     return_dict = {}
     seq_len = tf.shape(inputs)[1]  
     inputs = tf.transpose(inputs, [1, 0, 2])
@@ -608,30 +625,55 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       start_features = tf.tile(start_features[None], [seq_len, 1, 1])
       end_logits = self.end_logits_proj_layer0(
           tf.concat([inputs, start_features], axis=-1))
-      
       end_logits = self.end_logits_layer_norm(end_logits)
-
       end_logits = self.end_logits_proj_layer1(end_logits)
       end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
       end_logits_masked = end_logits * (1 - p_mask) - 1e30 * p_mask
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
     else:
-      pass
+      start_top_log_probs, start_top_index = tf.nn.top_k(
+          start_log_probs, k=self._start_n_top)
+      start_index = tf.one_hot(
+          start_top_index, depth=seq_len, axis=-1, dtype=tf.float32)
+      start_features = tf.einsum("lbh,bkl->bkh", inputs, start_index)
+      end_input = tf.tile(inputs[:, :, None], [1, 1, self._start_n_top, 1])
+      start_features = tf.tile(start_features[None], [seq_len, 1, 1, 1])
+      end_input = tf.concat([end_input, start_features], axis=-1)
+      end_logits = self.end_logits_proj_layer0(end_input)
+      end_logits = tf.reshape(end_logits, [seq_len, -1, self._hidden_size])
+      end_logits = self.end_logits_layer_norm(end_logits)
+
+      end_logits = tf.reshape(end_logits,
+          [seq_len, -1, self._start_n_top, self._hidden_size])
+
+      end_logits = self.end_logits_proj_layer1(end_logits)
+      end_logits = tf.reshape(end_logits, [seq_len, -1, self._start_n_top])
+      end_logits = tf.transpose(end_logits, [1, 2, 0])
+      end_logits_masked = end_logits * (
+          1 - p_mask[:, None]) - 1e30 * p_mask[:, None]
+      end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
+      end_top_log_probs, end_top_index = tf.nn.top_k(
+          end_log_probs, k=self._end_n_top)
+      end_top_log_probs = tf.reshape(end_top_log_probs,
+                                     [-1, self._start_n_top * self._end_n_top])
+      end_top_index = tf.reshape(end_top_index,
+                                 [-1, self._start_n_top * self._end_n_top])
 
     if training:
       return_dict["start_log_probs"] = start_log_probs
       return_dict["end_log_probs"] = end_log_probs
     else:
-      pass
+      return_dict["start_top_log_probs"] = start_top_log_probs
+      return_dict["start_top_index"] = start_top_index
+      return_dict["end_top_log_probs"] = end_top_log_probs
+      return_dict["end_top_index"] = end_top_index
 
     # get the representation of CLS
     cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype=tf.float32)
     cls_feature = tf.einsum("lbh,bl->bh", inputs, cls_index)
-
     # get the representation of START
     start_p = tf.nn.softmax(start_logits_masked, axis=-1, name="softmax_start")
     start_feature = tf.einsum("lbh,bl->bh", inputs, start_p)
-
     ans_feature = tf.concat([start_feature, cls_feature], -1)
     ans_feature = self.answer_class_proj_layer0(ans_feature)
     ans_feature = self.ans_feature_dropout(ans_feature)
@@ -639,22 +681,83 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
     cls_logits = tf.squeeze(cls_logits, -1)
     return_dict["cls_logits"] = cls_logits
 
-    def compute_loss(log_probs, positions):
-      one_hot_positions = tf.one_hot(positions, depth=seq_len, dtype=tf.float32)
+    if not training:
+      return return_dict
 
-      loss = -tf.reduce_sum(one_hot_positions * log_probs, axis=-1)
-      loss = tf.reduce_mean(loss)
-      return loss
+    return start_logits_masked, end_logits_masked, cls_logits
 
-    start_loss = compute_loss(start_log_probs, start_positions)
-    end_loss = compute_loss(end_log_probs, end_positions)
 
-    total_loss = (start_loss + end_loss) * 0.5
+class Summarization(tf.keras.layers.Layer):
+  def __init__(self,
+               hidden_size,
+               num_attention_heads,
+               head_size,
+               dropout_rate,
+               attention_dropout_rate,
+               initializer,
+               use_proj=True,
+               summary_type="last",
+               **kwargs):
+    super(Summarization, self).__init__(**kwargs)
+    self.hidden_size = hidden_size
+    self.num_attention_heads = num_attention_heads
+    self.head_size = head_size
+    self.initializer = initializer
 
-    is_impossible = tf.reshape(is_impossible, [-1])
-    regression_loss = tf.nn.sigmoid_cross_entropy_with_logits(
-        labels=is_impossible, logits=cls_logits)
-    regression_loss = tf.reduce_mean(regression_loss)
+    self.dropout_rate = dropout_rate
+    self.attention_dropout_rate = attention_dropout_rate
+    self.use_proj = use_proj
+    self.summary_type = summary_type
 
-    total_loss += regression_loss * 0.5
-    return total_loss, cls_logits
+  def build(self, unused_input_shapes):
+    """Implements build() for the layer."""
+    if self.use_proj:
+      self.proj_layer = tf.keras.layers.Dense(
+          units=self.hidden_size,
+          kernel_initializer=self.initializer,
+          activation=tf.nn.tanh,
+          name="summary")
+    self.dropout_layer = tf.keras.layers.Dropout(rate=self.dropout_rate)
+    super(Summarization, self).build(unused_input_shapes)
+
+  def call(self, inputs):
+    """Implements call() for the layer."""
+    if self.summary_type == "last":
+      summary = inputs[:, -1, :]
+    elif self.summary_type == "first":
+      summary = inputs[:, 0, :]
+    else:
+      raise ValueError("Invalid summary type provided: %s" % self.summary_type)
+    if self.use_proj:
+      summary = self.proj_layer(summary)
+    summary = self.dropout_layer(summary)
+    return summary
+
+
+class ClassificationLossLayer(tf.keras.layers.Layer):
+  """Layer computing cross entropy loss for classification task."""
+  def __init__(self, n_class, initializer, **kwargs):
+    """Constructs Summarization layer.
+
+    Args:
+      n_class: Number of tokens in vocabulary.
+      initializer: Initializer used for parameters.
+      **kwargs: Other parameters.
+    """
+    super(ClassificationLossLayer, self).__init__(**kwargs)
+    self.n_class = n_class
+    self.initializer = initializer
+
+  def build(self, unused_input_shapes):
+    """Implements build() for the layer."""
+    self.proj_layer = tf.keras.layers.Dense(
+        units=self.n_class, kernel_initializer=self.initializer, name="logit")
+    super(ClassificationLossLayer, self).build(unused_input_shapes)
+
+  def call(self, hidden, labels):
+    """Implements call() for the layer."""
+    logits = self.proj_layer(hidden)
+    one_hot_target = tf.one_hot(labels, self.n_class, dtype=hidden.dtype)
+    loss = -tf.reduce_sum(tf.nn.log_softmax(logits) * one_hot_target, -1)
+
+    return loss, logits
