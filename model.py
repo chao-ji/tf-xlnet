@@ -534,7 +534,7 @@ class PretrainLogits(tf.keras.layers.Layer):
       inputs_shape: tuple of ints or 1-D int tensor. Not used.
     """
     self._bias_output= self.add_weight(
-        "bias_output",
+        'bias_output',
         shape=[self._vocab_size],
         initializer=tf.zeros_initializer())
     super(PretrainLogits, self).build(inputs_shape)
@@ -553,91 +553,104 @@ class PretrainLogits(tf.keras.layers.Layer):
         logits over vocabulary.
     """
     outputs = self._layernorm_output(self._dense_output(query_stream))
-    logits = tf.einsum("NPD,VD->NPV", outputs, embeddings 
+    logits = tf.einsum('NPD,VD->NPV', outputs, embeddings 
         ) + self._bias_output
     return logits
 
 
 class QuestionAnwserLogits(tf.keras.layers.Layer):
-  def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate):
+  """Computes prediction logits for question answering tasks."""
+  def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate=0.1):
+    """Constructor.
+
+    Args:
+      hidden_size: int scalar, the hidden size of continuous representation.
+      start_n_top: int scalar, the number of top-scoring predictions for start
+        position.
+      end_n_top: int scalar, the number of top-scoring predictions for end
+        postion.
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+    """
     super(QuestionAnwserLogits, self).__init__()
     self._hidden_size = hidden_size
     self._start_n_top = start_n_top
     self._end_n_top = end_n_top
     self._dropout_rate = dropout_rate
 
-  def build(self, inputs_shape):
-    """Implements build() for the layer."""
     self.start_logits_proj_layer = tf.keras.layers.Dense(
-        units=1, kernel_initializer=None, name="start_logits/dense")
+        units=1, kernel_initializer=None)
     self.end_logits_proj_layer0 = tf.keras.layers.Dense(
-        units=self._hidden_size,
+        units=hidden_size,
         kernel_initializer=None,
-        activation=tf.nn.tanh,
-        name="end_logits/dense_0")
+        activation=tf.nn.tanh)
     self.end_logits_proj_layer1 = tf.keras.layers.Dense(
-        units=1, kernel_initializer=None, name="end_logits/dense_1")
+        units=1, kernel_initializer=None)
     self.end_logits_layer_norm = tf.keras.layers.LayerNormalization(
-        axis=-1, epsilon=1e-12, name="end_logits/LayerNorm")
+        axis=-1, epsilon=1e-12)
     self.answer_class_proj_layer0 = tf.keras.layers.Dense(
-        units=self._hidden_size,
+        units=hidden_size,
         kernel_initializer=None,
-        activation=tf.nn.tanh,
-        name="answer_class/dense_0")
+        activation=tf.nn.tanh)
     self.answer_class_proj_layer1 = tf.keras.layers.Dense(
         units=1,
         kernel_initializer=None,
-        use_bias=False,
-        name="answer_class/dense_1")
+        use_bias=False)
     self.ans_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
-    super(QuestionAnwserLogits, self).build(inputs_shape)
 
   def call(self,
            inputs,
-           p_mask,
+           paragraph_mask,
            cls_index,
            start_positions=None,
            end_positions=None,
            is_impossible=None,
            training=True):
-    """
+    """Computes logits for start position, end position and the `CLS` token.
+
     Args:
-      inputs: float tensor of shape [batch_size, seq_len, hidden_size]
-      p_mask: float tensor of shape [batch_size, seq_len], binary values
+      inputs: float tensor of shape [batch_size, seq_len, hidden_size], vector
+        representation for sequences.
+      paragraph_mask: float tensor of shape [batch_size, seq_len], mask for
+        paragraph tokens.
       cls_index: int tensor of shape [batch_size], indices of the CLS token in
         `inputs`.
-      start_positions: int tensor of shape [batch_size],
-      end_positions: int tensor of shape [batch_size],
-      is_impossible: float tensor of shape [batch_size], binary values
+      start_positions: (Optional )int tensor of shape [batch_size], answer start
+        positions.
+      end_positions: (Optional) int tensor of shape [batch_size], answer end
+        positions.
+      is_impossible: (Optional) float tensor of shape [batch_size], indicating
+        if question is answerable.
+      training: (Optional) bool scalar, True if in training mode.
     """
-    return_dict = {}
     seq_len = tf.shape(inputs)[1]  
     inputs = tf.transpose(inputs, [1, 0, 2])
     start_logits = self.start_logits_proj_layer(inputs)
     start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
-    start_logits_masked = start_logits * (1 - p_mask) - 1e30 * p_mask
+    start_logits_masked = start_logits * (1 - paragraph_mask
+        ) - 1e30 * paragraph_mask
     start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
     if training:
       start_positions = tf.reshape(start_positions, [-1])
       start_index = tf.one_hot(
-          start_positions, depth=seq_len, axis=-1, dtype=tf.float32)
-      start_features = tf.einsum("lbh,bl->bh", inputs, start_index)
-      start_features = tf.tile(start_features[None], [seq_len, 1, 1])
+          start_positions, depth=seq_len, axis=-1, dtype='float32')
+      start_features = tf.einsum("TND,NT->ND", inputs, start_index)
+      start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1])
       end_logits = self.end_logits_proj_layer0(
           tf.concat([inputs, start_features], axis=-1))
       end_logits = self.end_logits_layer_norm(end_logits)
       end_logits = self.end_logits_proj_layer1(end_logits)
       end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
-      end_logits_masked = end_logits * (1 - p_mask) - 1e30 * p_mask
+      end_logits_masked = end_logits * (1 - paragraph_mask
+          ) - 1e30 * paragraph_mask
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
     else:
       start_top_log_probs, start_top_index = tf.nn.top_k(
           start_log_probs, k=self._start_n_top)
       start_index = tf.one_hot(
-          start_top_index, depth=seq_len, axis=-1, dtype=tf.float32)
-      start_features = tf.einsum("lbh,bkl->bkh", inputs, start_index)
-      end_input = tf.tile(inputs[:, :, None], [1, 1, self._start_n_top, 1])
-      start_features = tf.tile(start_features[None], [seq_len, 1, 1, 1])
+          start_top_index, depth=seq_len, axis=-1, dtype='float32')
+      start_features = tf.einsum("TND,NKT->NKD", inputs, start_index)
+      end_input = tf.tile(inputs[:, :, tf.newaxis], [1, 1, self._start_n_top, 1])
+      start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1, 1])
       end_input = tf.concat([end_input, start_features], axis=-1)
       end_logits = self.end_logits_proj_layer0(end_input)
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._hidden_size])
@@ -650,7 +663,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._start_n_top])
       end_logits = tf.transpose(end_logits, [1, 2, 0])
       end_logits_masked = end_logits * (
-          1 - p_mask[:, None]) - 1e30 * p_mask[:, None]
+          1 - paragraph_mask[:, tf.newaxis]) - 1e30 * paragraph_mask[:, tf.newaxis]
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
       end_top_log_probs, end_top_index = tf.nn.top_k(
           end_log_probs, k=self._end_n_top)
@@ -660,104 +673,170 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
                                  [-1, self._start_n_top * self._end_n_top])
 
     if training:
-      return_dict["start_log_probs"] = start_log_probs
-      return_dict["end_log_probs"] = end_log_probs
+      outputs = {"start_log_probs": start_log_probs,
+                 "end_log_probs": end_log_probs}
     else:
-      return_dict["start_top_log_probs"] = start_top_log_probs
-      return_dict["start_top_index"] = start_top_index
-      return_dict["end_top_log_probs"] = end_top_log_probs
-      return_dict["end_top_index"] = end_top_index
+      outputs = {"start_top_log_probs": start_top_log_probs,
+                 "start_top_index": start_top_index,
+                 "end_top_log_probs": end_top_log_probs,
+                 "end_top_index": end_top_index}
 
-    # get the representation of CLS
-    cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype=tf.float32)
-    cls_feature = tf.einsum("lbh,bl->bh", inputs, cls_index)
-    # get the representation of START
-    start_p = tf.nn.softmax(start_logits_masked, axis=-1, name="softmax_start")
-    start_feature = tf.einsum("lbh,bl->bh", inputs, start_p)
+    cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype='float32')
+    cls_feature = tf.einsum("TND,NT->ND", inputs, cls_index)
+    start_p = tf.nn.softmax(start_logits_masked, axis=-1)
+    start_feature = tf.einsum("TND,NT->ND", inputs, start_p)
     ans_feature = tf.concat([start_feature, cls_feature], -1)
     ans_feature = self.answer_class_proj_layer0(ans_feature)
     ans_feature = self.ans_feature_dropout(ans_feature)
     cls_logits = self.answer_class_proj_layer1(ans_feature)
     cls_logits = tf.squeeze(cls_logits, -1)
-    return_dict["cls_logits"] = cls_logits
+    outputs["cls_logits"] = cls_logits
 
     if not training:
-      return return_dict
+      return outputs
 
     return start_logits_masked, end_logits_masked, cls_logits
 
 
-class Summarization(tf.keras.layers.Layer):
+class PretrainingXLNet(XLNetModel):
   def __init__(self,
+               vocab_size,
+               stack_size,
                hidden_size,
-               num_attention_heads,
-               head_size,
+               num_heads,
+               filter_size,
+               mem_len,
+               reuse_len,
                dropout_rate,
-               attention_dropout_rate,
-               initializer,
-               use_proj=True,
-               summary_type="last",
-               **kwargs):
-    super(Summarization, self).__init__(**kwargs)
-    self.hidden_size = hidden_size
-    self.num_attention_heads = num_attention_heads
-    self.head_size = head_size
-    self.initializer = initializer
+               dropout_rate_attention,
+               tie_biases):
+    super(PretrainingXLNet, self).__init__(
+        vocab_size=vocab_size,
+        stack_size=stack_size,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        filter_size=filter_size,
+        mem_len=mem_len,
+        reuse_len=reuse_len,
+        dropout_rate=dropout_rate,
+        dropout_rate_attention=dropout_rate_attention,
+        tie_biases=tie_biases)
+    self._logits_layer = PretrainLogits(hidden_size=hidden_size,
+                                        vocab_size=vocab_size)
 
-    self.dropout_rate = dropout_rate
-    self.attention_dropout_rate = attention_dropout_rate
-    self.use_proj = use_proj
-    self.summary_type = summary_type
-
-  def build(self, unused_input_shapes):
-    """Implements build() for the layer."""
-    if self.use_proj:
-      self.proj_layer = tf.keras.layers.Dense(
-          units=self.hidden_size,
-          kernel_initializer=self.initializer,
-          activation=tf.nn.tanh,
-          name="summary")
-    self.dropout_layer = tf.keras.layers.Dropout(rate=self.dropout_rate)
-    super(Summarization, self).build(unused_input_shapes)
-
-  def call(self, inputs):
-    """Implements call() for the layer."""
-    if self.summary_type == "last":
-      summary = inputs[:, -1, :]
-    elif self.summary_type == "first":
-      summary = inputs[:, 0, :]
-    else:
-      raise ValueError("Invalid summary type provided: %s" % self.summary_type)
-    if self.use_proj:
-      summary = self.proj_layer(summary)
-    summary = self.dropout_layer(summary)
-    return summary
+  def call(self, input_ids, seg_ids, perm_mask, target_mapping, mems):
+    model_output, new_mems = super(PretrainingXLNet, self).call(
+        input_ids, seg_ids, perm_mask, target_mapping, mems)
+    logits = self._logits_layer(
+        model_output, self._embedding_layer.weights[0])
+    return logits, new_mems
 
 
-class ClassificationLossLayer(tf.keras.layers.Layer):
-  """Layer computing cross entropy loss for classification task."""
-  def __init__(self, n_class, initializer, **kwargs):
-    """Constructs Summarization layer.
+class QuestionAnswerXLNet(XLNetModel):
+  """XLNet model for question-answer tasks (e.g. SQuAD).
 
-    Args:
-      n_class: Number of tokens in vocabulary.
-      initializer: Initializer used for parameters.
-      **kwargs: Other parameters.
-    """
-    super(ClassificationLossLayer, self).__init__(**kwargs)
-    self.n_class = n_class
-    self.initializer = initializer
+  Computes logits for start position, end position and the `CLS` token.
+  """
+  def __init__(self, 
+               vocab_size,
+               stack_size,
+               hidden_size,
+               num_heads,
+               filter_size,
+               mem_len,
+               reuse_len,
+               dropout_rate,
+               dropout_rate_attention,
+               tie_biases,
+               two_stream,
+               uni_data,
+               filter_activation,
+               start_n_top,
+               end_n_top):
+    super(QuestionAnswerXLNet, self).__init__(
+        vocab_size=vocab_size,
+        stack_size=stack_size,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        filter_size=filter_size,
+        mem_len=mem_len,
+        reuse_len=reuse_len,
+        dropout_rate=dropout_rate,
+        dropout_rate_attention=dropout_rate_attention,
+        tie_biases=tie_biases,
+        two_stream=two_stream,
+        uni_data=uni_data,
+        filter_activation=filter_activation)
+    self._logits_layer = QuestionAnwserLogits(
+        hidden_size, start_n_top, end_n_top, dropout_rate=0.)
 
-  def build(self, unused_input_shapes):
-    """Implements build() for the layer."""
-    self.proj_layer = tf.keras.layers.Dense(
-        units=self.n_class, kernel_initializer=self.initializer, name="logit")
-    super(ClassificationLossLayer, self).build(unused_input_shapes)
+  def call(self,
+           input_ids,
+           segment_ids,
+           perm_mask,
+           p_mask,
+           cls_index,
+           start_positions=None,
+           end_positions=None,
+           is_impossible=None,
+           training=False):
+    model_output = super(QuestionAnswerXLNet, self).call(
+        input_ids, segment_ids, perm_mask)
+    outputs = self._logits_layer(model_output,
+                                 p_mask,
+                                 cls_index,
+                                 start_positions=start_positions,
+                                 end_positions=end_positions,
+                                 is_impossible=is_impossible,
+                                 training=training)
+    return outputs
 
-  def call(self, hidden, labels):
-    """Implements call() for the layer."""
-    logits = self.proj_layer(hidden)
-    one_hot_target = tf.one_hot(labels, self.n_class, dtype=hidden.dtype)
-    loss = -tf.reduce_sum(tf.nn.log_softmax(logits) * one_hot_target, -1)
 
-    return loss, logits
+class ClassificationXLNet(XLNetModel):
+  def __init__(self,
+               vocab_size,
+               stack_size,
+               hidden_size,
+               num_heads,
+               filter_size,
+               mem_len,
+               reuse_len,
+               dropout_rate,
+               dropout_rate_attention,
+               tie_biases,
+               two_stream,
+               uni_data,
+               filter_activation,
+               num_classes):
+    super(ClassificationXLNet, self).__init__(
+        vocab_size=vocab_size,
+        stack_size=stack_size,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        filter_size=filter_size,
+        mem_len=mem_len,
+        reuse_len=reuse_len,
+        dropout_rate=dropout_rate,
+        dropout_rate_attention=dropout_rate_attention,
+        tie_biases=tie_biases,
+        two_stream=two_stream,
+        uni_data=uni_data,
+        filter_activation=filter_activation)
+
+    self._proj_layer = tf.keras.layers.Dense(
+        units=hidden_size, kernel_initializer=None, activation=tf.nn.tanh)
+    self._dropout_layer = tf.keras.layers.Dropout(dropout_rate)
+    self._proj_layer1 = tf.keras.layers.Dense(
+        units=num_classes, kernel_initializer=None)
+
+  def call(self, input_ids, segment_ids, input_mask):
+    outputs = super(ClassificationXLNet, self).call(
+        input_ids, segment_ids, input_mask)
+ 
+    summary = outputs[:, -1, :]
+    summary = self._proj_layer(summary)
+    summary = self._dropout_layer(summary)
+
+    logits = self._proj_layer1(summary)
+
+    return logits
