@@ -1,15 +1,18 @@
 """Defines XLNet model in tf.keras.API."""
 import tensorflow as tf
 
+from commons.beam_searc import NEG_INF
 from commons.layers import FeedForwardNetwork
 from commons.layers import RelativeAttention
 
+from utils import cache_memory
 from utils import compute_attention_mask
 from utils import compute_position_encoding 
 from utils import compute_segment_matrix 
-from utils import cache_memory 
 from utils import get_position_encoding
 
+
+NEG_INF = -1e30
 
 class DecoderLayer(tf.keras.layers.Layer):
   """The building block that makes the decoder stack of layers, consisting of a 
@@ -627,7 +630,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
     start_logits = self.start_logits_proj_layer(inputs)
     start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
     start_logits_masked = start_logits * (1 - paragraph_mask
-        ) - 1e30 * paragraph_mask
+        ) + NEG_INF * paragraph_mask
     start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
     if training:
       start_positions = tf.reshape(start_positions, [-1])
@@ -641,7 +644,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       end_logits = self.end_logits_proj_layer1(end_logits)
       end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
       end_logits_masked = end_logits * (1 - paragraph_mask
-          ) - 1e30 * paragraph_mask
+          ) + NEG_INF * paragraph_mask
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
     else:
       start_top_log_probs, start_top_index = tf.nn.top_k(
