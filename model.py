@@ -23,8 +23,8 @@ class DecoderLayer(tf.keras.layers.Layer):
                hidden_size,
                num_heads,
                filter_size,
-               dropout_rate,
-               dropout_rate_attention,
+               dropout_rate=0.0,
+               dropout_rate_attention=0.0,
                filter_activation=tf.nn.relu):
     """Constructor.
 
@@ -33,9 +33,9 @@ class DecoderLayer(tf.keras.layers.Layer):
       num_heads: int scalar, num of attention heads.
       filter_size: int scalar, the depth of the intermediate dense layer of the
         feed-forward sublayer.
-      dropout_rate: float scalar, dropout rate for the Dropout layers.
-      dropout_rate_attention: float scalar, dropout rate applied on the
-        query-to-reference attention matrix.
+      dropout_rate: (Optional) float scalar, dropout rate for the Dropout layers
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix.
       filter_activation: (Optional) callable or string, activation function of
         the filter dense layer. Defaults to ReLU.
     """
@@ -162,7 +162,7 @@ class DecoderLayer(tf.keras.layers.Layer):
 
 class TransformerXLModel(tf.keras.layers.Layer):
   """TransformerXL adapted to optionally process query stream in addition to
-  content stram.
+  content stream.
   """
   def __init__(self,
                vocab_size,
@@ -172,7 +172,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
                filter_size=2048,
                mem_len=384,
                reuse_len=256,
-               dropout_rate=0.1,
+               dropout_rate=0.0,
                dropout_rate_attention=0.0,
                tie_biases=True,
                filter_activation=tf.nn.relu):
@@ -355,9 +355,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
 
 
 class XLNetModel(tf.keras.layers.Layer):
-  """XLNet model for pretraining as described in 
-  https://arxiv.org/abs/1906.08237
-  """
+  """XLNet model as described in https://arxiv.org/abs/1906.08237"""
   def __init__(self,
                vocab_size,
                mem_len,
@@ -366,7 +364,7 @@ class XLNetModel(tf.keras.layers.Layer):
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               dropout_rate=0.1,
+               dropout_rate=0.0,
                dropout_rate_attention=0.0, 
                tie_biases=False,
                two_stream=True,
@@ -387,9 +385,9 @@ class XLNetModel(tf.keras.layers.Layer):
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
         the query-to-reference attention matrix.
-      tie_biases: bool scalar, whether to force all layers use the same
-        content, position and segment bias (True), or create the biases for each
-        layer (False).
+      tie_biases: bool scalar, whether to force all layers use the same content,
+        position and segment bias (True), or create the biases for each layer (
+        False).
       two_stream: (Optional) bool scalar, whether to process both content and
         query stream (True) or just content stream (False).
       uni_data: (Optional) bool scalar, whether the data is unidirectional or
@@ -398,14 +396,13 @@ class XLNetModel(tf.keras.layers.Layer):
         the filter dense layer. Defaults to ReLU.
     """
     super(XLNetModel, self).__init__()
-
     self._vocab_size = vocab_size
+    self._mem_len = mem_len
+    self._reuse_len = reuse_len
     self._stack_size = stack_size 
     self._hidden_size = hidden_size
     self._num_heads = num_heads
     self._filter_size = filter_size
-    self._mem_len = mem_len
-    self._reuse_len = reuse_len
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
@@ -417,19 +414,18 @@ class XLNetModel(tf.keras.layers.Layer):
 
     self._embedding_layer = tf.keras.layers.Embedding(vocab_size, hidden_size)
     self._dropout_layer = tf.keras.layers.Dropout(rate=dropout_rate)
-
     self._transformer_xl = TransformerXLModel(
-               vocab_size,
-               stack_size=stack_size,
-               hidden_size=hidden_size,
-               num_heads=num_heads,
-               filter_size=filter_size,
-               mem_len=mem_len,
-               reuse_len=reuse_len,
-               dropout_rate=dropout_rate,
-               dropout_rate_attention=dropout_rate_attention,
-               tie_biases=tie_biases,
-               filter_activation=filter_activation)
+        vocab_size,
+        stack_size=stack_size,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        filter_size=filter_size,
+        mem_len=mem_len,
+        reuse_len=reuse_len,
+        dropout_rate=dropout_rate,
+        dropout_rate_attention=dropout_rate_attention,
+        tie_biases=tie_biases,
+        filter_activation=filter_activation)
 
   def build(self, inputs_shape):
     """Creates weights of this layer.
@@ -511,7 +507,7 @@ class XLNetModel(tf.keras.layers.Layer):
 
 class QuestionAnwserLogits(tf.keras.layers.Layer):
   """Computes prediction logits for question answering tasks."""
-  def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate=0.1):
+  def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate=0.0):
     """Constructor.
 
     Args:
@@ -600,7 +596,8 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       start_index = tf.one_hot(
           start_top_index, depth=seq_len, axis=-1, dtype='float32')
       start_features = tf.einsum('TND,NKT->NKD', inputs, start_index)
-      end_input = tf.tile(inputs[:, :, tf.newaxis], [1, 1, self._start_n_top, 1])
+      end_input = tf.tile(inputs[:, :, tf.newaxis],
+                          [1, 1, self._start_n_top, 1])
       start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1, 1])
       end_input = tf.concat([end_input, start_features], axis=-1)
       end_logits = self.end_logits_proj_layer0(end_input)
@@ -653,12 +650,9 @@ class PretrainingXLNet(XLNetModel):
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               dropout_rate=0.1,
+               dropout_rate=0.0,
                dropout_rate_attention=0.0,
-               tie_biases=False,
-               two_stream=True,
-               uni_data=False,
-               filter_activation=tf.nn.relu):
+               tie_biases=False):
     """Constructor.
 
     Args:
@@ -677,25 +671,18 @@ class PretrainingXLNet(XLNetModel):
       tie_biases: bool scalar, whether to force all layers use the same content,
         position and segment bias (True), or create the biases for each layer (
         False).
-      two_stream: (Optional) bool scalar, whether to process both content and
-        query stream (True) or just content stream (False).
-      uni_data: (Optional) bool scalar, whether the data is unidirectional or
-        bidirectional. Defaults to False.
-      filter_activation: (Optional) callable or string, activation function of
-        the filter dense layer. Defaults to ReLU.
     """
     super(PretrainingXLNet, self).__init__(
         vocab_size=vocab_size,
+        mem_len=mem_len,
+        reuse_len=reuse_len,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
         filter_size=filter_size,
-        mem_len=mem_len,
-        reuse_len=reuse_len,
         dropout_rate=dropout_rate,
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases)
-
     self._dense_layer_output = tf.keras.layers.Dense(
           units=hidden_size,
           kernel_initializer=None,
@@ -723,7 +710,6 @@ class PretrainingXLNet(XLNetModel):
         segment_ids: int tensor of shape [batch_size, seq_len], segment IDs for
             tokens in input sequences.
         permutation_mask: bool tensor of shape [batch_size, seq_len, seq_len],
-
         target_mapping: float tensor of shape [batch_size, num_predictions,
           hidden_size], one-hot encodings of the indices of prediction targets.
         mems: float tensor of shape [batch_size, stack_size, m_seq_len
@@ -756,12 +742,9 @@ class QuestionAnswerXLNet(XLNetModel):
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               dropout_rate=0.1,
+               dropout_rate=0.0,
                dropout_rate_attention=0.0,
                tie_biases=False,
-               two_stream=True,
-               uni_data=False,
-               filter_activation=tf.nn.relu,
                start_n_top=5,
                end_n_top=5):
     """Constructor.
@@ -782,12 +765,6 @@ class QuestionAnswerXLNet(XLNetModel):
       tie_biases: bool scalar, whether to force all layers use the same content,
         position and segment bias (True), or create the biases for each layer (
         False).
-      two_stream: (Optional) bool scalar, whether to process both content and
-        query stream (True) or just content stream (False).
-      uni_data: (Optional) bool scalar, whether the data is unidirectional or
-        bidirectional. Defaults to False.
-      filter_activation: (Optional) callable or string, activation function of
-        the filter dense layer. Defaults to ReLU.
       start_n_top: (Optional) int scalar, the number of top-scoring predictions
         for start position.
       end_n_top: (Optional) int scalar, the number of top-scoring predictions
@@ -795,19 +772,18 @@ class QuestionAnswerXLNet(XLNetModel):
     """
     super(QuestionAnswerXLNet, self).__init__(
         vocab_size=vocab_size,
+        mem_len=0,
+        reuse_len=reuse_len,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
         filter_size=filter_size,
-        mem_len=mem_len,
-        reuse_len=reuse_len,
         dropout_rate=dropout_rate,
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases,
-        two_stream=two_stream,
-        uni_data=uni_data,
-        filter_activation=filter_activation)
-
+        two_stream=False,
+        uni_data=True,
+        filter_activation=tf.nn.gelu)
     self._logits_layer = QuestionAnwserLogits(
         hidden_size, start_n_top, end_n_top, dropout_rate=0.)
 
@@ -858,7 +834,7 @@ class ClassificationXLNet(XLNetModel):
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               dropout_rate=0.1,
+               dropout_rate=0.0,
                dropout_rate_attention=0.0,
                tie_biases=False,
                two_stream=True,
@@ -883,29 +859,22 @@ class ClassificationXLNet(XLNetModel):
       tie_biases: bool scalar, whether to force all layers use the same content,
         position and segment bias (True), or create the biases for each layer (
         False).
-      two_stream: (Optional) bool scalar, whether to process both content and
-        query stream (True) or just content stream (False).
-      uni_data: (Optional) bool scalar, whether the data is unidirectional or
-        bidirectional. Defaults to False.
-      filter_activation: (Optional) callable or string, activation function of
-        the filter dense layer. Defaults to ReLU.
       num_classes: (Optional) int scalar, num of classes.
     """
     super(ClassificationXLNet, self).__init__(
         vocab_size=vocab_size,
+        mem_len=0,
+        reuse_len=reuse_len,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
         filter_size=filter_size,
-        mem_len=mem_len,
-        reuse_len=reuse_len,
         dropout_rate=dropout_rate,
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases,
-        two_stream=two_stream,
-        uni_data=uni_data,
-        filter_activation=filter_activation)
-
+        two_stream=False,
+        uni_data=True,
+        filter_activation=tf.nn.gelu)
     self._dense_layer_output = tf.keras.layers.Dense(
         units=hidden_size, kernel_initializer=None, activation=tf.nn.tanh)
     self._dropout_layer = tf.keras.layers.Dropout(dropout_rate)
@@ -914,6 +883,7 @@ class ClassificationXLNet(XLNetModel):
 
   def call(self, inputs, segment_ids, input_mask):
     """
+
     Args:
       inputs: [batch_size, seq_len]
       segment_ids: [batch_size, seq_len]
