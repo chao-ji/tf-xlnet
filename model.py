@@ -1,7 +1,7 @@
 """Defines XLNet model in tf.keras.API."""
 import tensorflow as tf
 
-from commons.beam_searc import NEG_INF
+from commons.beam_search import NEG_INF
 from commons.layers import FeedForwardNetwork
 from commons.layers import RelativeAttention
 
@@ -360,12 +360,12 @@ class XLNetModel(tf.keras.layers.Layer):
   """
   def __init__(self,
                vocab_size,
+               mem_len,
+               reuse_len,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               mem_len=384,
-               reuse_len=256,
                dropout_rate=0.1,
                dropout_rate_attention=0.0, 
                tie_biases=False,
@@ -375,19 +375,18 @@ class XLNetModel(tf.keras.layers.Layer):
     """Constructor.
 
     Args:
-      vocab_size: (Optional) int scalar, vocabulary size.
+      vocab_size: int scalar, vocabulary size.
+      mem_len: int scalar, num tokens to be cached.
+      reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
         representation.
       num_heads: (Optional) int scalar, num of attention heads.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
         layer of the feed-forward sublayer.
-      mem_len: (Optional) int scalar, num tokens to be cacched.
-      reuse_len: (Optional) int scalar, num of tokens to be reused in the next
-        batch.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix. 
+        the query-to-reference attention matrix.
       tie_biases: bool scalar, whether to force all layers use the same
         content, position and segment bias (True), or create the biases for each
         layer (False).
@@ -451,7 +450,7 @@ class XLNetModel(tf.keras.layers.Layer):
   def call(self, 
            inputs,
            segment_ids,
-           perm_mask,
+           permutation_mask,
            target_mapping=None,
            mems=None):
     """Computes the output query stream and update the memories.
@@ -462,8 +461,9 @@ class XLNetModel(tf.keras.layers.Layer):
       segment_ids: int tensor of shape [batch_size, q_seq_len], matrix populated
         with 0, 1, or 2, which indicates the corresponding index in `inputs`
         is from the first and second sequence segment, or is the `CLS` token.
-      perm_mask: int tensor of shape [batch_size, q_seq_len, q_seq_len], binary
-        matrix where 1 means the corresponding position cannot be attended to.
+      permutation_mask: int tensor of shape [batch_size, q_seq_len, q_seq_len],
+        binary matrix where 1 means the corresponding position cannot be
+        attended to.
       target_mapping: (Optional) float tensor of shape [batch_size, num_targets,
         q_seq_len], one-hot encodings of the indices of prediction targets.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
@@ -481,7 +481,7 @@ class XLNetModel(tf.keras.layers.Layer):
     q_seq_len = tf.shape(inputs)[1]
     m_seq_len = 0 if mems is None else tf.shape(mems[0])[1]
     content_mask, query_mask = compute_attention_mask(
-        perm_mask, m_seq_len, q_seq_len)
+        permutation_mask, m_seq_len, q_seq_len)
 
     relative_position_encoding = self._dropout_layer(compute_position_encoding(
         self._hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data))
@@ -507,58 +507,6 @@ class XLNetModel(tf.keras.layers.Layer):
         target_mapping)
 
     return outputs
-
-
-class PretrainLogits(tf.keras.layers.Layer):
-  """Converts query stream to final prediction logit for the permutation
-  language model objects.
-  """
-  def __init__(self, hidden_size, vocab_size):
-    """Constructor.
-
-    Args:
-      hidden_size: int scalar, the hidden size of continuous representation.
-      vocab_size: int scalar, vocabulary size.
-    """
-    super(PretrainLogits, self).__init__()
-    self._hidden_size = hidden_size
-    self._vocab_size = vocab_size
-
-    self._dense_output = tf.keras.layers.Dense(
-          units=hidden_size,
-          kernel_initializer=None,
-          activation=lambda x: tf.keras.activations.gelu(x, approximate=True))
-    self._layernorm_output = tf.keras.layers.LayerNormalization(epsilon=1e-12)
-
-  def build(self, inputs_shape):
-    """Creates weights of this layer.
-
-    Args:
-      inputs_shape: tuple of ints or 1-D int tensor. Not used.
-    """
-    self._bias_output= self.add_weight(
-        'bias_output',
-        shape=[self._vocab_size],
-        initializer=tf.zeros_initializer())
-    super(PretrainLogits, self).build(inputs_shape)
-
-  def call(self, query_stream, embeddings):
-    """Computes logits tensor.
-
-    Args:
-      query_stream: float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
-      embeddings: float tensor of shape [vocab_size, hidden_size], embedding
-        vectors for all tokens in the vocabulary.
-
-    Returns:
-      logits: float tensor of shape [batch_size, num_targets, vocab_size],
-        logits over vocabulary.
-    """
-    outputs = self._layernorm_output(self._dense_output(query_stream))
-    logits = tf.einsum('NPD,VD->NPV', outputs, embeddings 
-        ) + self._bias_output
-    return logits
 
 
 class QuestionAnwserLogits(tf.keras.layers.Layer):
@@ -636,7 +584,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       start_positions = tf.reshape(start_positions, [-1])
       start_index = tf.one_hot(
           start_positions, depth=seq_len, axis=-1, dtype='float32')
-      start_features = tf.einsum("TND,NT->ND", inputs, start_index)
+      start_features = tf.einsum('TND,NT->ND', inputs, start_index)
       start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1])
       end_logits = self.end_logits_proj_layer0(
           tf.concat([inputs, start_features], axis=-1))
@@ -651,7 +599,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
           start_log_probs, k=self._start_n_top)
       start_index = tf.one_hot(
           start_top_index, depth=seq_len, axis=-1, dtype='float32')
-      start_features = tf.einsum("TND,NKT->NKD", inputs, start_index)
+      start_features = tf.einsum('TND,NKT->NKD', inputs, start_index)
       end_input = tf.tile(inputs[:, :, tf.newaxis], [1, 1, self._start_n_top, 1])
       start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1, 1])
       end_input = tf.concat([end_input, start_features], axis=-1)
@@ -665,8 +613,8 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       end_logits = self.end_logits_proj_layer1(end_logits)
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._start_n_top])
       end_logits = tf.transpose(end_logits, [1, 2, 0])
-      end_logits_masked = end_logits * (
-          1 - paragraph_mask[:, tf.newaxis]) - 1e30 * paragraph_mask[:, tf.newaxis]
+      end_logits_masked = end_logits * (1 - paragraph_mask[:, tf.newaxis]
+          ) + NEG_INF * paragraph_mask[:, tf.newaxis]
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
       end_top_log_probs, end_top_index = tf.nn.top_k(
           end_log_probs, k=self._end_n_top)
@@ -675,44 +623,67 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
       end_top_index = tf.reshape(end_top_index,
                                  [-1, self._start_n_top * self._end_n_top])
 
-    if training:
-      outputs = {"start_log_probs": start_log_probs,
-                 "end_log_probs": end_log_probs}
-    else:
-      outputs = {"start_top_log_probs": start_top_log_probs,
-                 "start_top_index": start_top_index,
-                 "end_top_log_probs": end_top_log_probs,
-                 "end_top_index": end_top_index}
-
     cls_index = tf.one_hot(cls_index, seq_len, axis=-1, dtype='float32')
-    cls_feature = tf.einsum("TND,NT->ND", inputs, cls_index)
+    cls_feature = tf.einsum('TND,NT->ND', inputs, cls_index)
     start_p = tf.nn.softmax(start_logits_masked, axis=-1)
-    start_feature = tf.einsum("TND,NT->ND", inputs, start_p)
+    start_feature = tf.einsum('TND,NT->ND', inputs, start_p)
     ans_feature = tf.concat([start_feature, cls_feature], -1)
     ans_feature = self.answer_class_proj_layer0(ans_feature)
     ans_feature = self.ans_feature_dropout(ans_feature)
     cls_logits = self.answer_class_proj_layer1(ans_feature)
     cls_logits = tf.squeeze(cls_logits, -1)
-    outputs["cls_logits"] = cls_logits
 
-    if not training:
-      return outputs
-
-    return start_logits_masked, end_logits_masked, cls_logits
+    if training:
+      return start_logits_masked, end_logits_masked, cls_logits
+    else:
+      return (start_top_log_probs,
+              start_top_index,
+              end_top_log_probs,
+              end_top_index,
+              cls_logits)
 
 
 class PretrainingXLNet(XLNetModel):
+  """XLNet for pretraining."""
   def __init__(self,
                vocab_size,
-               stack_size,
-               hidden_size,
-               num_heads,
-               filter_size,
                mem_len,
                reuse_len,
-               dropout_rate,
-               dropout_rate_attention,
-               tie_biases):
+               stack_size=6,
+               hidden_size=512,
+               num_heads=8,
+               filter_size=2048,
+               dropout_rate=0.1,
+               dropout_rate_attention=0.0,
+               tie_biases=False,
+               two_stream=True,
+               uni_data=False,
+               filter_activation=tf.nn.relu):
+    """Constructor.
+
+    Args:
+      vocab_size: int scalar, vocabulary size.
+      mem_len: int scalar, num tokens to be cached.
+      reuse_len: int scalar, num of tokens to be reused in the next batch.
+      stack_size: (Optional) int scalar, num of layers in the decoder stack.
+      hidden_size: (Optional) int scalar, the hidden size of continuous
+        representation.
+      num_heads: (Optional) int scalar, num of attention heads.
+      filter_size: (Optional) int scalar, the depth of the intermediate dense
+        layer of the feed-forward sublayer.
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix.
+      tie_biases: bool scalar, whether to force all layers use the same content,
+        position and segment bias (True), or create the biases for each layer (
+        False).
+      two_stream: (Optional) bool scalar, whether to process both content and
+        query stream (True) or just content stream (False).
+      uni_data: (Optional) bool scalar, whether the data is unidirectional or
+        bidirectional. Defaults to False.
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
+    """
     super(PretrainingXLNet, self).__init__(
         vocab_size=vocab_size,
         stack_size=stack_size,
@@ -724,14 +695,51 @@ class PretrainingXLNet(XLNetModel):
         dropout_rate=dropout_rate,
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases)
-    self._logits_layer = PretrainLogits(hidden_size=hidden_size,
-                                        vocab_size=vocab_size)
 
-  def call(self, input_ids, seg_ids, perm_mask, target_mapping, mems):
-    model_output, new_mems = super(PretrainingXLNet, self).call(
-        input_ids, seg_ids, perm_mask, target_mapping, mems)
-    logits = self._logits_layer(
-        model_output, self._embedding_layer.weights[0])
+    self._dense_layer_output = tf.keras.layers.Dense(
+          units=hidden_size,
+          kernel_initializer=None,
+          activation=lambda x: tf.keras.activations.gelu(x, approximate=True))
+    self._layernorm_output = tf.keras.layers.LayerNormalization(epsilon=1e-12)
+
+  def build(self, inputs_shape):
+    """Creates weights of this layer.
+
+    Args:
+      inputs_shape: tuple of ints or 1-D int tensor. Not used.
+    """
+    self._bias_output= self.add_weight(
+        'bias_output',
+        shape=[self._vocab_size],
+        initializer=tf.zeros_initializer())
+    super(PretrainingXLNet, self).build(inputs_shape)
+
+  def call(self, inputs, segment_ids, permutation_mask, target_mapping, mems):
+    """Compute permutation language modeling logits and update memory.
+
+    Args:
+        inputs: int tensor of shape [batch_size, seq_len], token IDs for input
+            sequences.
+        segment_ids: int tensor of shape [batch_size, seq_len], segment IDs for
+            tokens in input sequences.
+        permutation_mask: bool tensor of shape [batch_size, seq_len, seq_len],
+
+        target_mapping: float tensor of shape [batch_size, num_predictions,
+          hidden_size], one-hot encodings of the indices of prediction targets.
+        mems: float tensor of shape [batch_size, stack_size, m_seq_len
+          , hidden_size], encodings of the memory sequences from the previous
+          block.
+
+    Returns:
+        logits: float tensor of shape [batch_size,]
+        new_mems: float tensor of shape [batch_size, mem_len, hidden_size]
+    """
+    outputs, new_mems = super(PretrainingXLNet, self).call(
+        inputs, segment_ids, permutation_mask, target_mapping, mems)
+    outputs = self._layernorm_output(self._dense_layer_output(outputs))
+    logits = tf.einsum('NPD,VD->NPV', outputs, self._embedding_layer.weights[0]
+        ) + self._bias_output
+
     return logits, new_mems
 
 
@@ -742,20 +750,49 @@ class QuestionAnswerXLNet(XLNetModel):
   """
   def __init__(self, 
                vocab_size,
-               stack_size,
-               hidden_size,
-               num_heads,
-               filter_size,
                mem_len,
                reuse_len,
-               dropout_rate,
-               dropout_rate_attention,
-               tie_biases,
-               two_stream,
-               uni_data,
-               filter_activation,
-               start_n_top,
-               end_n_top):
+               stack_size=6,
+               hidden_size=512,
+               num_heads=8,
+               filter_size=2048,
+               dropout_rate=0.1,
+               dropout_rate_attention=0.0,
+               tie_biases=False,
+               two_stream=True,
+               uni_data=False,
+               filter_activation=tf.nn.relu,
+               start_n_top=5,
+               end_n_top=5):
+    """Constructor.
+
+    Args:
+      vocab_size: int scalar, vocabulary size.
+      mem_len: int scalar, num tokens to be cached.
+      reuse_len: int scalar, num of tokens to be reused in the next batch.
+      stack_size: (Optional) int scalar, num of layers in the decoder stack.
+      hidden_size: (Optional) int scalar, the hidden size of continuous
+        representation.
+      num_heads: (Optional) int scalar, num of attention heads.
+      filter_size: (Optional) int scalar, the depth of the intermediate dense
+        layer of the feed-forward sublayer.
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix.
+      tie_biases: bool scalar, whether to force all layers use the same content,
+        position and segment bias (True), or create the biases for each layer (
+        False).
+      two_stream: (Optional) bool scalar, whether to process both content and
+        query stream (True) or just content stream (False).
+      uni_data: (Optional) bool scalar, whether the data is unidirectional or
+        bidirectional. Defaults to False.
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
+      start_n_top: (Optional) int scalar, the number of top-scoring predictions
+        for start position.
+      end_n_top: (Optional) int scalar, the number of top-scoring predictions
+        for end postion.
+    """
     super(QuestionAnswerXLNet, self).__init__(
         vocab_size=vocab_size,
         stack_size=stack_size,
@@ -770,22 +807,38 @@ class QuestionAnswerXLNet(XLNetModel):
         two_stream=two_stream,
         uni_data=uni_data,
         filter_activation=filter_activation)
+
     self._logits_layer = QuestionAnwserLogits(
         hidden_size, start_n_top, end_n_top, dropout_rate=0.)
 
   def call(self,
-           input_ids,
+           inputs,
            segment_ids,
-           perm_mask,
+           permutation_mask,
            p_mask,
            cls_index,
            start_positions=None,
            end_positions=None,
            is_impossible=None,
            training=False):
-    model_output = super(QuestionAnswerXLNet, self).call(
-        input_ids, segment_ids, perm_mask)
-    outputs = self._logits_layer(model_output,
+    """
+    Args:
+      inputs: int tensor of shape [batch_size, seq_len]
+      segment_ids: int tensor of shape [batch_size, seq_len]
+      permutation_mask: bool tensor of shape [batch_size, 1, seq_len]
+      p_mask: bool tensor of shape [batch_size, seq_len]
+      cls_index: int tensor of shape [batch_size] 
+      start_positions: (Optional) int tensor of shape [batch_size] 
+      end_postions: (Optional) int tensor of shape [batch_size]
+      is_impossible: (Optional) bool tensor of shape [batch_size]
+      training: (Optional) bool scalar, True if in training mode.
+
+    Returns:
+      outputs:   
+    """
+    outputs = super(QuestionAnswerXLNet, self).call(
+        inputs, segment_ids, permutation_mask)
+    outputs = self._logits_layer(outputs,
                                  p_mask,
                                  cls_index,
                                  start_positions=start_positions,
@@ -796,21 +849,48 @@ class QuestionAnswerXLNet(XLNetModel):
 
 
 class ClassificationXLNet(XLNetModel):
+  """XLNet for sequence (or sequence pair) classification."""
   def __init__(self,
                vocab_size,
-               stack_size,
-               hidden_size,
-               num_heads,
-               filter_size,
                mem_len,
                reuse_len,
-               dropout_rate,
-               dropout_rate_attention,
-               tie_biases,
-               two_stream,
-               uni_data,
-               filter_activation,
-               num_classes):
+               stack_size=6,
+               hidden_size=512,
+               num_heads=8,
+               filter_size=2048,
+               dropout_rate=0.1,
+               dropout_rate_attention=0.0,
+               tie_biases=False,
+               two_stream=True,
+               uni_data=False,
+               filter_activation=tf.nn.relu,
+               num_classes=2):
+    """Constructor.
+
+    Args:
+      vocab_size: int scalar, vocabulary size.
+      mem_len: int scalar, num tokens to be cached.
+      reuse_len: int scalar, num of tokens to be reused in the next batch.
+      stack_size: (Optional) int scalar, num of layers in the decoder stack.
+      hidden_size: (Optional) int scalar, the hidden size of continuous
+        representation.
+      num_heads: (Optional) int scalar, num of attention heads.
+      filter_size: (Optional) int scalar, the depth of the intermediate dense
+        layer of the feed-forward sublayer.
+      dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+      dropout_rate_attention: (Optional) float scalar, dropout rate applied on
+        the query-to-reference attention matrix.
+      tie_biases: bool scalar, whether to force all layers use the same content,
+        position and segment bias (True), or create the biases for each layer (
+        False).
+      two_stream: (Optional) bool scalar, whether to process both content and
+        query stream (True) or just content stream (False).
+      uni_data: (Optional) bool scalar, whether the data is unidirectional or
+        bidirectional. Defaults to False.
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
+      num_classes: (Optional) int scalar, num of classes.
+    """
     super(ClassificationXLNet, self).__init__(
         vocab_size=vocab_size,
         stack_size=stack_size,
@@ -826,20 +906,26 @@ class ClassificationXLNet(XLNetModel):
         uni_data=uni_data,
         filter_activation=filter_activation)
 
-    self._proj_layer = tf.keras.layers.Dense(
+    self._dense_layer_output = tf.keras.layers.Dense(
         units=hidden_size, kernel_initializer=None, activation=tf.nn.tanh)
     self._dropout_layer = tf.keras.layers.Dropout(dropout_rate)
-    self._proj_layer1 = tf.keras.layers.Dense(
+    self._dense_layer_logits = tf.keras.layers.Dense(
         units=num_classes, kernel_initializer=None)
 
-  def call(self, input_ids, segment_ids, input_mask):
-    outputs = super(ClassificationXLNet, self).call(
-        input_ids, segment_ids, input_mask)
- 
-    summary = outputs[:, -1, :]
-    summary = self._proj_layer(summary)
-    summary = self._dropout_layer(summary)
+  def call(self, inputs, segment_ids, input_mask):
+    """
+    Args:
+      inputs: [batch_size, seq_len]
+      segment_ids: [batch_size, seq_len]
+      input_mask: [batch_size, 1, seq_len]
 
-    logits = self._proj_layer1(summary)
+    Returns:
+      logits: float tensor of shape [batch_size, num_classes], logits for
+        classification.
+    """
+    outputs = super(ClassificationXLNet, self).call(
+        inputs, segment_ids, input_mask)[:, -1]
+    outputs = self._dropout_layer(self._dense_layer_output(outputs))
+    logits = self._dense_layer_logits(outputs)
 
     return logits
