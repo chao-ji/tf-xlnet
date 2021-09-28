@@ -505,7 +505,7 @@ class XLNetModel(tf.keras.layers.Layer):
     return outputs
 
 
-class QuestionAnwserLogits(tf.keras.layers.Layer):
+class QuestionAnswerLogits(tf.keras.layers.Layer):
   """Computes prediction logits for question answering tasks."""
   def __init__(self, hidden_size, start_n_top, end_n_top, dropout_rate=0.0):
     """Constructor.
@@ -518,38 +518,37 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
         postion.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
     """
-    super(QuestionAnwserLogits, self).__init__()
+    super(QuestionAnswerLogits, self).__init__()
     self._hidden_size = hidden_size
     self._start_n_top = start_n_top
     self._end_n_top = end_n_top
     self._dropout_rate = dropout_rate
 
-    self.start_logits_proj_layer = tf.keras.layers.Dense(
+    self._start_logits_dense_layer = tf.keras.layers.Dense(
         units=1, kernel_initializer=None)
-    self.end_logits_proj_layer0 = tf.keras.layers.Dense(
+    self._end_logits_dense_layer0 = tf.keras.layers.Dense(
         units=hidden_size,
         kernel_initializer=None,
         activation=tf.nn.tanh)
-    self.end_logits_proj_layer1 = tf.keras.layers.Dense(
+    self._end_logits_dense_layer1 = tf.keras.layers.Dense(
         units=1, kernel_initializer=None)
-    self.end_logits_layer_norm = tf.keras.layers.LayerNormalization(
+    self._end_logits_layer_norm = tf.keras.layers.LayerNormalization(
         axis=-1, epsilon=1e-12)
-    self.answer_class_proj_layer0 = tf.keras.layers.Dense(
+    self._answer_class_dense_layer0 = tf.keras.layers.Dense(
         units=hidden_size,
         kernel_initializer=None,
         activation=tf.nn.tanh)
-    self.answer_class_proj_layer1 = tf.keras.layers.Dense(
+    self._answer_class_dense_layer1 = tf.keras.layers.Dense(
         units=1,
         kernel_initializer=None,
         use_bias=False)
-    self.ans_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
+    self._answer_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
 
   def call(self,
            inputs,
            paragraph_mask,
            cls_index,
            start_positions=None,
-           end_positions=None,
            is_impossible=None,
            training=True):
     """Computes logits for start position, end position and the `CLS` token.
@@ -561,9 +560,7 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
         paragraph tokens.
       cls_index: int tensor of shape [batch_size], indices of the CLS token in
         `inputs`.
-      start_positions: (Optional )int tensor of shape [batch_size], answer start
-        positions.
-      end_positions: (Optional) int tensor of shape [batch_size], answer end
+      start_positions: (Optional) int tensor of shape [batch_size], answer start
         positions.
       is_impossible: (Optional) float tensor of shape [batch_size], indicating
         if question is answerable.
@@ -571,26 +568,24 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
     """
     seq_len = tf.shape(inputs)[1]  
     inputs = tf.transpose(inputs, [1, 0, 2])
-    start_logits = self.start_logits_proj_layer(inputs)
+    start_logits = self._start_logits_dense_layer(inputs)
     start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
     start_logits_masked = start_logits * (1 - paragraph_mask
         ) + NEG_INF * paragraph_mask
-    start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
     if training:
-      start_positions = tf.reshape(start_positions, [-1])
       start_index = tf.one_hot(
           start_positions, depth=seq_len, axis=-1, dtype='float32')
       start_features = tf.einsum('TND,NT->ND', inputs, start_index)
       start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1])
-      end_logits = self.end_logits_proj_layer0(
+      end_logits = self._end_logits_dense_layer0(
           tf.concat([inputs, start_features], axis=-1))
-      end_logits = self.end_logits_layer_norm(end_logits)
-      end_logits = self.end_logits_proj_layer1(end_logits)
+      end_logits = self._end_logits_layer_norm(end_logits)
+      end_logits = self._end_logits_dense_layer1(end_logits)
       end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
       end_logits_masked = end_logits * (1 - paragraph_mask
           ) + NEG_INF * paragraph_mask
-      end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
     else:
+      start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
       start_top_log_probs, start_top_index = tf.nn.top_k(
           start_log_probs, k=self._start_n_top)
       start_index = tf.one_hot(
@@ -600,14 +595,14 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
                           [1, 1, self._start_n_top, 1])
       start_features = tf.tile(start_features[tf.newaxis], [seq_len, 1, 1, 1])
       end_input = tf.concat([end_input, start_features], axis=-1)
-      end_logits = self.end_logits_proj_layer0(end_input)
+      end_logits = self._end_logits_dense_layer0(end_input)
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._hidden_size])
-      end_logits = self.end_logits_layer_norm(end_logits)
+      end_logits = self._end_logits_layer_norm(end_logits)
 
       end_logits = tf.reshape(end_logits,
           [seq_len, -1, self._start_n_top, self._hidden_size])
 
-      end_logits = self.end_logits_proj_layer1(end_logits)
+      end_logits = self._end_logits_dense_layer1(end_logits)
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._start_n_top])
       end_logits = tf.transpose(end_logits, [1, 2, 0])
       end_logits_masked = end_logits * (1 - paragraph_mask[:, tf.newaxis]
@@ -625,9 +620,9 @@ class QuestionAnwserLogits(tf.keras.layers.Layer):
     start_p = tf.nn.softmax(start_logits_masked, axis=-1)
     start_feature = tf.einsum('TND,NT->ND', inputs, start_p)
     ans_feature = tf.concat([start_feature, cls_feature], -1)
-    ans_feature = self.answer_class_proj_layer0(ans_feature)
-    ans_feature = self.ans_feature_dropout(ans_feature)
-    cls_logits = self.answer_class_proj_layer1(ans_feature)
+    ans_feature = self._answer_class_dense_layer0(ans_feature)
+    ans_feature = self._answer_feature_dropout(ans_feature)
+    cls_logits = self._answer_class_dense_layer1(ans_feature)
     cls_logits = tf.squeeze(cls_logits, -1)
 
     if training:
@@ -736,7 +731,6 @@ class QuestionAnswerXLNet(XLNetModel):
   """
   def __init__(self, 
                vocab_size,
-               mem_len,
                reuse_len,
                stack_size=6,
                hidden_size=512,
@@ -751,7 +745,6 @@ class QuestionAnswerXLNet(XLNetModel):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      mem_len: int scalar, num tokens to be cached.
       reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
@@ -784,8 +777,8 @@ class QuestionAnswerXLNet(XLNetModel):
         two_stream=False,
         uni_data=True,
         filter_activation=tf.nn.gelu)
-    self._logits_layer = QuestionAnwserLogits(
-        hidden_size, start_n_top, end_n_top, dropout_rate=0.)
+    self._logits_layer = QuestionAnswerLogits(
+        hidden_size, start_n_top, end_n_top, dropout_rate=dropout_rate)
 
   def call(self,
            inputs,
@@ -794,7 +787,6 @@ class QuestionAnswerXLNet(XLNetModel):
            p_mask,
            cls_index,
            start_positions=None,
-           end_positions=None,
            is_impossible=None,
            training=False):
     """
@@ -818,7 +810,6 @@ class QuestionAnswerXLNet(XLNetModel):
                                  p_mask,
                                  cls_index,
                                  start_positions=start_positions,
-                                 end_positions=end_positions,
                                  is_impossible=is_impossible,
                                  training=training)
     return outputs
@@ -828,7 +819,6 @@ class ClassificationXLNet(XLNetModel):
   """XLNet for sequence (or sequence pair) classification."""
   def __init__(self,
                vocab_size,
-               mem_len,
                reuse_len,
                stack_size=6,
                hidden_size=512,
@@ -837,15 +827,11 @@ class ClassificationXLNet(XLNetModel):
                dropout_rate=0.0,
                dropout_rate_attention=0.0,
                tie_biases=False,
-               two_stream=True,
-               uni_data=False,
-               filter_activation=tf.nn.relu,
                num_classes=2):
     """Constructor.
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      mem_len: int scalar, num tokens to be cached.
       reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
@@ -873,7 +859,6 @@ class ClassificationXLNet(XLNetModel):
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases,
         two_stream=False,
-        uni_data=True,
         filter_activation=tf.nn.gelu)
     self._dense_layer_output = tf.keras.layers.Dense(
         units=hidden_size, kernel_initializer=None, activation=tf.nn.tanh)
