@@ -7,7 +7,7 @@ from commons.layers import RelativeAttention
 
 from utils import cache_memory
 from utils import compute_attention_mask
-from utils import compute_position_encoding 
+from utils import compute_position_encoding
 from utils import compute_segment_matrix 
 from utils import get_position_encoding
 
@@ -15,9 +15,9 @@ from utils import get_position_encoding
 NEG_INF = -1e30
 
 class DecoderLayer(tf.keras.layers.Layer):
-  """The building block that makes the decoder stack of layers, consisting of a 
-  self-attention sublayer and a feed-forward sublayer. Takes content stream (and
-  optionally query stream) as input sequences.
+  """TransformerXL is created by stacking up multiple copies of this layer. Each
+  layer contains a self-attention sublayer followed by a feed-forward sublayer.
+  Takes content stream (and optionally query stream) as input sequences.
   """
   def __init__(self,
                hidden_size,
@@ -100,14 +100,14 @@ class DecoderLayer(tf.keras.layers.Layer):
       query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
         c_seq_len], token mask for query stream.
       target_mapping: (Optional) float tensor of shape [batch_size,
-        num_predictions, hidden_size], one-hot encodings of the indices of
+        num_predictions, q_seq_len], one-hot encodings of the indices of
         prediction targets. 
       training: (Optional) bool scalar, True if in training mode.
 
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden_size], for
         single stream input; or a tuple of two tensors of shape [batch_size,
-        q_seq_len, hidden_size] and [batch_size, num_targets, hidden_size].
+        q_seq_len, hidden_size] and [batch_size, num_predictions, hidden_size].
     """
     kwargs = {'content_stream': content_stream,
               'content_mask': content_mask,
@@ -161,7 +161,7 @@ class DecoderLayer(tf.keras.layers.Layer):
 
 
 class TransformerXLModel(tf.keras.layers.Layer):
-  """TransformerXL adapted to optionally process query stream in addition to
+  """TransformerXL adapted to optionally process query stream on top of
   content stream.
   """
   def __init__(self,
@@ -188,16 +188,15 @@ class TransformerXLModel(tf.keras.layers.Layer):
         layer of the feed-forward sublayer.
       mem_len: (Optional) int scalar, num tokens to be cached.
       reuse_len: (Optional) int scalar, num of tokens to be reused in the next
-        batch. 
+        batch.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix. 
+        the query-to-reference attention matrix.
       tie_biases: (Optional) bool scalar, whether to force all layers use the
         same content bias and position bias (True), or create the biases for
         each layer (False).
-      two_steram: (Optional) bool scalar, whether to apply multi-headed
-        attention with both content and query stream (True), or just content
-        stream (False).
+      filter_activation: (Optional) callable or string, activation function of
+        the filter dense layer. Defaults to ReLU.
     """
     super(TransformerXLModel, self).__init__()
     self._vocab_size = vocab_size
@@ -210,6 +209,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
     self._dropout_rate = dropout_rate
     self._dropout_rate_attention = dropout_rate_attention
     self._tie_biases = tie_biases
+    self._filter_activation = filter_activation
 
     self._size_per_head = hidden_size // num_heads
 
@@ -229,11 +229,9 @@ class TransformerXLModel(tf.keras.layers.Layer):
       inputs_shape: tuple of ints or 1-D int tensor. Not used.
     """
     if self._tie_biases:
-      bias_shape = [self._num_heads, self._hidden_size // self._num_heads]
+      bias_shape = [self._num_heads, self._size_per_head]
     else:
-      bias_shape = [self._stack_size,
-                    self._num_heads,
-                    self._hidden_size // self._num_heads]
+      bias_shape = [self._stack_size, self._num_heads, self._size_per_head]
 
     self._content_bias = self.add_weight(
         'content_bias',
@@ -291,21 +289,22 @@ class TransformerXLModel(tf.keras.layers.Layer):
       segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
         q_seq_len], indicator matrix specifying if two positions are from the
         same segment or not.
-      query_stream: (Optional) float tensor of shape [batch_size, num_targets,
-        hidden_size], input query stream.
+      query_stream: (Optional) float tensor of shape [batch_size,
+        num_predictions, hidden_size], input query stream.
       query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
         m_seq_len + q_seq_len], permutation mask for the query stream.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
         block.
-      target_mapping: (Optional) float tensor of shape [batch_size, num_targets,
-        q_seq_len], one-hot encodings of the indices of prediction targets.
+      target_mapping: (Optional) float tensor of shape [batch_size,
+        num_predictions, q_seq_len], one-hot encodings of the indices of
+        prediction targets.
       training: (Optional) bool scalar, True if in training mode.
  
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
-        query stream in new representation, if `two_stream` is False; Or, a 
-        tuple of two float tensors of shape [batch_size, num_targets,
+        content stream in new representation, if `two_stream` is False; Or, a
+        tuple of two float tensors of shape [batch_size, num_predictions,
         hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
         output query stream and updated memory, if `two_stream` is True.
     """
@@ -358,8 +357,8 @@ class XLNetModel(tf.keras.layers.Layer):
   """XLNet model as described in https://arxiv.org/abs/1906.08237"""
   def __init__(self,
                vocab_size,
-               mem_len,
-               reuse_len,
+               mem_len=384,
+               reuse_len=256,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
@@ -374,8 +373,9 @@ class XLNetModel(tf.keras.layers.Layer):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      mem_len: int scalar, num tokens to be cached.
-      reuse_len: int scalar, num of tokens to be reused in the next batch.
+      mem_len: (Optional) int scalar, num tokens to be cached.
+      reuse_len: (Optional) int scalar, num of tokens to be reused in the next
+        batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
         representation.
@@ -443,7 +443,7 @@ class XLNetModel(tf.keras.layers.Layer):
               trainable=True)
     super(XLNetModel, self).build(inputs_shape)
 
-  def call(self, 
+  def call(self,
            inputs,
            segment_ids,
            permutation_mask,
@@ -460,16 +460,17 @@ class XLNetModel(tf.keras.layers.Layer):
       permutation_mask: int tensor of shape [batch_size, q_seq_len, q_seq_len],
         binary matrix where 1 means the corresponding position cannot be
         attended to.
-      target_mapping: (Optional) float tensor of shape [batch_size, num_targets,
-        q_seq_len], one-hot encodings of the indices of prediction targets.
+      target_mapping: (Optional) float tensor of shape [batch_size,
+        num_predictions, q_seq_len], one-hot encodings of the indices of
+        prediction targets.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
         block.
 
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
-        query stream in new representation, if `two_stream` is False; Or, a 
-        tuple of two float tensors of shape [batch_size, num_targets,
+        content stream in new representation, if `two_stream` is False; Or, a
+        tuple of two float tensors of shape [batch_size, num_predictions,
         hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
         output query stream and updated memory, if `two_stream` is True.
     """
@@ -706,7 +707,7 @@ class PretrainingXLNet(XLNetModel):
             tokens in input sequences.
         permutation_mask: bool tensor of shape [batch_size, seq_len, seq_len],
         target_mapping: float tensor of shape [batch_size, num_predictions,
-          hidden_size], one-hot encodings of the indices of prediction targets.
+          q_seq_len], one-hot encodings of the indices of prediction targets.
         mems: float tensor of shape [batch_size, stack_size, m_seq_len
           , hidden_size], encodings of the memory sequences from the previous
           block.
@@ -731,7 +732,6 @@ class QuestionAnswerXLNet(XLNetModel):
   """
   def __init__(self, 
                vocab_size,
-               reuse_len,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
@@ -745,7 +745,6 @@ class QuestionAnswerXLNet(XLNetModel):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
         representation.
@@ -765,8 +764,6 @@ class QuestionAnswerXLNet(XLNetModel):
     """
     super(QuestionAnswerXLNet, self).__init__(
         vocab_size=vocab_size,
-        mem_len=0,
-        reuse_len=reuse_len,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -819,7 +816,6 @@ class ClassificationXLNet(XLNetModel):
   """XLNet for sequence (or sequence pair) classification."""
   def __init__(self,
                vocab_size,
-               reuse_len,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
@@ -832,7 +828,6 @@ class ClassificationXLNet(XLNetModel):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
       hidden_size: (Optional) int scalar, the hidden size of continuous
         representation.
@@ -849,8 +844,6 @@ class ClassificationXLNet(XLNetModel):
     """
     super(ClassificationXLNet, self).__init__(
         vocab_size=vocab_size,
-        mem_len=0,
-        reuse_len=reuse_len,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -859,6 +852,7 @@ class ClassificationXLNet(XLNetModel):
         dropout_rate_attention=dropout_rate_attention,
         tie_biases=tie_biases,
         two_stream=False,
+        uni_data=True,
         filter_activation=tf.nn.gelu)
     self._dense_layer_output = tf.keras.layers.Dense(
         units=hidden_size, kernel_initializer=None, activation=tf.nn.tanh)
