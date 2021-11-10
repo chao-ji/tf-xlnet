@@ -5,11 +5,11 @@ from commons.beam_search import NEG_INF
 from commons.layers import FeedForwardNetwork
 from commons.layers import RelativeAttention
 
-from utils import cache_memory
-from utils import compute_attention_mask
-from utils import compute_position_encoding
-from utils import compute_segment_matrix 
-from utils import get_position_encoding
+from model_utils import cache_memory
+from model_utils import compute_attention_mask
+from model_utils import compute_position_encoding
+from model_utils import compute_segment_matrix 
+from model_utils import get_position_encoding
 
 
 NEG_INF = -1e30
@@ -170,8 +170,8 @@ class TransformerXLModel(tf.keras.layers.Layer):
                hidden_size=512,
                num_heads=8,
                filter_size=2048,
-               mem_len=384,
-               reuse_len=256,
+               mem_len=0,
+               reuse_len=0,
                dropout_rate=0.0,
                dropout_rate_attention=0.0,
                tie_biases=True,
@@ -357,8 +357,8 @@ class XLNetModel(tf.keras.layers.Layer):
   """XLNet model as described in https://arxiv.org/abs/1906.08237"""
   def __init__(self,
                vocab_size,
-               mem_len=384,
-               reuse_len=256,
+               mem_len=0,
+               reuse_len=0,
                stack_size=6,
                hidden_size=512,
                num_heads=8,
@@ -678,7 +678,10 @@ class PretrainingXLNet(XLNetModel):
         filter_size=filter_size,
         dropout_rate=dropout_rate,
         dropout_rate_attention=dropout_rate_attention,
-        tie_biases=tie_biases)
+        tie_biases=tie_biases,
+        two_stream=True,
+        uni_data=False,
+        filter_activation=tf.nn.relu)
     self._dense_layer_output = tf.keras.layers.Dense(
           units=hidden_size,
           kernel_initializer=None,
@@ -764,6 +767,8 @@ class QuestionAnswerXLNet(XLNetModel):
     """
     super(QuestionAnswerXLNet, self).__init__(
         vocab_size=vocab_size,
+        mem_len=0,
+        reuse_len=0,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -844,6 +849,8 @@ class ClassificationXLNet(XLNetModel):
     """
     super(ClassificationXLNet, self).__init__(
         vocab_size=vocab_size,
+        mem_len=0,
+        reuse_len=0,
         stack_size=stack_size,
         hidden_size=hidden_size,
         num_heads=num_heads,
