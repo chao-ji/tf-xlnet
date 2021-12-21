@@ -1,7 +1,7 @@
-"""Defines utility functions."""
+"""Defines functions to be used for building XLNet model architecture."""
 import tensorflow as tf
 
-SEG_ID_CLS = 2
+from text_utils import SEG_ID_CLS
 
 
 def cache_memory(inputs, memory=None, mem_len=0, reuse_len=0):
@@ -12,9 +12,9 @@ def cache_memory(inputs, memory=None, mem_len=0, reuse_len=0):
       sequences.
     memory: (Optional) float tensor of shape [batch_size, m_seq_len, hidden_size
       ], memory for the current segment.
-    mem_len: (Optional) int scalar, num tokens to be cached. 
+    mem_len: (Optional) int scalar, num tokens to be cached.
     reuse_len: (Optional) int scalar, length of the input sequences to be reused
-      as part of the cache memory sequences. 
+      as part of the cache memory sequences.
 
   Returns:
     new_memory: float tensor of shape [batch_size, mem_len, hidden_size]
@@ -53,9 +53,9 @@ def compute_attention_mask(perm_mask, m_seq_len, q_seq_len):
   return content_mask, query_mask
 
 
-def compute_position_encoding(
+def get_position_encoding_xlnet(
     hidden_size, batch_size, m_seq_len, q_seq_len, uni_data=False):
-  """Computes position encoding matrix.
+  """Computes position encoding matrix for XLNet.
 
   Args:
     hidden_size: int scalar, the hidden size of continuous representation.
@@ -67,7 +67,7 @@ def compute_position_encoding(
 
   Returns:
     relative_position_encoding: float tensor of shape [batch_size, m_seq_len +
-      2 * q_seq_len, hidden_size], the tensor that encodes position 
+      2 * q_seq_len, hidden_size], the tensor that encodes position
       information.
   """
   def uni_data_position_encoding(hidden_size, batch_size, pos_seq):
@@ -94,29 +94,15 @@ def compute_position_encoding(
       [fw_position_encoding, bw_position_encoding], axis=0)
     return relative_position_encoding
 
-  fw_pos_seq = tf.range(m_seq_len + q_seq_len, -q_seq_len, -1.0)
-  bw_pos_seq = tf.range(-m_seq_len - q_seq_len, q_seq_len, 1.0)
-
-  fw_position_encoding = get_position_encoding(fw_pos_seq, hidden_size)
-  bw_position_encoding = get_position_encoding(bw_pos_seq, hidden_size)
-  fw_position_encoding = tf.tile(fw_position_encoding[tf.newaxis],
-                                   [batch_size // 2, 1, 1])
-  bw_position_encoding = tf.tile(bw_position_encoding[tf.newaxis],
-                                   [batch_size // 2, 1, 1])
-  relative_position_encoding = tf.concat(
-      [fw_position_encoding, bw_position_encoding], axis=0)
-  return relative_position_encoding
-
 
 def compute_segment_matrix(segment_ids, m_seq_len, use_cls_mask=True):
   """Computes the binary matrix indicating whether two positions are from the
   same segment or not.
 
   Args:
-    segment_ids: int tensor of shape [batch_size, q_seq_len], integer matrix
-      populated with 0, 1, or 2, where 0 and 1 indicates the corresponding
-      position is from the first and the second segment, respectively; and 2
-      represents the special token `CLS`.
+    segment_ids: int tensor of shape [batch_size, q_seq_len], where
+        `segment_ids[b]` is an vector of segment IDs for each token in
+        `token_ids`.
     m_seq_len: int scalar, memory sequence length.
     use_cls_mask: (Optional) bool scalar, whether to use mask for the special
       token CLS. Defaults to True.

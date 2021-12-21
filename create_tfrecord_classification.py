@@ -6,15 +6,16 @@ import sentencepiece as spm
 import tensorflow as tf
 from absl import app
 from absl import flags
+from absl import logging
 
 from text_utils import encode_ids
 from text_utils import preprocess_text
-from text_utils import SEG_ID_P 
+from text_utils import SEG_ID_P
 from text_utils import SEG_ID_Q
-from text_utils import SEG_ID_CLS 
-from text_utils import SEG_ID_PAD 
-from text_utils import CLS_ID 
-from text_utils import SEP_ID 
+from text_utils import SEG_ID_CLS
+from text_utils import SEG_ID_PAD
+from text_utils import CLS_ID
+from text_utils import SEP_ID
 
 
 flags.DEFINE_string(
@@ -28,13 +29,21 @@ flags.DEFINE_string(
     'dev_output_file_path', './imdb_dev.tfrecord', 'Path to the output file '
         'for the dev split')
 flags.DEFINE_integer(
-    'max_seq_length', 512, 'Maximum sequence length.')
+    'seq_len', 512, 'Maximum number of tokens in a sequence.')
 
 FLAGS = flags.FLAGS
 
 
-def _create_examples(data_dir):
-  examples = []
+def _read_imdb_data(data_dir):
+  """Read raw IMDB data.
+
+  Args:
+    data_dir: string scalar, path to the directory containing IMDB data.
+
+  Returns:
+    instances: list of dicts, IMDB instances.
+  """
+  instances = []
   for label in ['neg', 'pos']:
     cur_dir = os.path.join(data_dir, label)
     for filename in tf.io.gfile.listdir(cur_dir):
@@ -44,140 +53,87 @@ def _create_examples(data_dir):
       path = os.path.join(cur_dir, filename)
       with tf.io.gfile.GFile(path) as f:
         text = f.read().strip().replace("<br />", " ")
-      examples.append(
-          {'text_a': text, 'text_b': None, 'label': label})
-  return examples
+      instances.append(
+          {'text': text, 'label': label})
+  return instances
 
 
-def _tokenize_fn(sp, text):
-  text = preprocess_text(text, lower=False)
-  return encode_ids(sp, text)
+def _convert_single_instance(instance, label_list, seq_len, sp_model):
+  """Converts a single `InputExample` into a single `InputFeatures`.
+
+  Args:
+    instance: dict, an IMDB instance.
+    label_list: list of strings, sequence-level labels.
+    seq_len: int scalar, max number of tokens in a sequence.
+    sp_model: an instance of SentencePieceProcessor, sentence piece processor.
+
+  Returns:
+    instance: dict with the following entries,
+      'token_ids' -> list of integers, token IDs of the text
+      'pad_mask' -> list of floats, sequence of 1's and 0's where 1's indicate
+        padded (masked) tokens.
+      'seg_ids' -> list of integers, sequence of segment IDs.
+      'label_ids' -> int scalar, sequence-level label.
+  """
+  label_map = {}
+  for (i, label) in enumerate(label_list):
+    label_map[label] = i
+
+  token_ids = encode_ids(
+      sp_model, preprocess_text(instance['text'], lower=False))[:seq_len-2]
+
+  token_ids = token_ids + [SEP_ID, CLS_ID]
+  seg_ids = (len(token_ids) - 1) * [SEG_ID_P] + [SEG_ID_CLS]
+
+  pad_mask = [0] * len(token_ids)
+
+  if len(token_ids) < seq_len:
+    pad_len = seq_len - len(token_ids)
+
+    token_ids = [0] * pad_len + token_ids
+    pad_mask = [1] * pad_len + pad_mask
+    seg_ids = [SEG_ID_PAD] * pad_len + seg_ids
+
+  label_id = label_map[instance['label']]
+  instance = {'token_ids': token_ids,
+             'pad_mask': pad_mask,
+             'seg_ids': seg_ids,
+             'label_ids': label_id}
+
+  return instance
 
 
-def _convert_single_example(example_index, example, label_list, max_seq_length,
-                           _tokenize_fn, sp, use_bert_format):
-  """Converts a single `InputExample` into a single `InputFeatures`."""
-  if label_list is not None:
-    label_map = {}
-    for (i, label) in enumerate(label_list):
-      label_map[label] = i
+def _convert_imdb_instances_to_tfrecord(instances,
+                                        label_list,
+                                        seq_len,
+                                        sp_model,
+                                        output_filename):
+  """Convert IMDB instances to TFRecord file.
 
-  tokens_a = _tokenize_fn(sp, example['text_a'])
-  tokens_b = None
-  if example['text_b']:
-    tokens_b = _tokenize_fn(sp, example['text_b'])
+  Args:
+    instances: list of dict, IMDB instances.
+    label_list: list of strings, sequence-level labels.
+    seq_len: int scalar, max number of tokens in a sequence.
+    sp_model: an instance of SentencePieceProcessor, sentence piece processor.
+    output_filename: string scalar, path to the output TFRecord file.
+  """
+  with tf.io.TFRecordWriter(output_filename) as record_writer:
+    for index, instance in enumerate(instances):
+      if index % 1000 == 0:
+        logging.info(f'Processing instance {index}')
 
-  if tokens_b:
-    # Modifies `tokens_a` and `tokens_b` in place so that the total
-    # length is less than the specified length.
-    # Account for two [SEP] & one [CLS] with "- 3"
-    _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
-  else:
-    # Account for one [SEP] & one [CLS] with "- 2"
-    if len(tokens_a) > max_seq_length - 2:
-      tokens_a = tokens_a[:max_seq_length - 2]
+      feature = _convert_single_instance(instance, label_list, seq_len, sp_model)
+      feature = {'token_ids': tf.train.Feature(int64_list=
+                     tf.train.Int64List(value=list(feature['token_ids']))),
+                 'pad_mask': tf.train.Feature(float_list=
+                     tf.train.FloatList(value=list(feature['pad_mask']))),
+                 'seg_ids': tf.train.Feature(int64_list=
+                     tf.train.Int64List(value=list(feature['seg_ids']))),
+                 'label_ids': tf.train.Feature(int64_list=
+                     tf.train.Int64List(value=[feature['label_ids']]))}
 
-  tokens = []
-  segment_ids = []
-  for token in tokens_a:
-    tokens.append(token)
-    segment_ids.append(SEG_ID_P)
-  tokens.append(SEP_ID)
-  segment_ids.append(SEG_ID_P)
-
-  if tokens_b:
-    for token in tokens_b:
-      tokens.append(token)
-      segment_ids.append(SEG_ID_Q)
-    tokens.append(SEP_ID)
-    segment_ids.append(SEG_ID_Q)
-
-  if use_bert_format:
-    tokens.insert(0, CLS_ID)
-    segment_ids.insert(0, SEG_ID_CLS)
-  else:
-    tokens.append(CLS_ID)
-    segment_ids.append(SEG_ID_CLS)
-
-  input_ids = tokens
-
-  # The mask has 0 for real tokens and 1 for padding tokens. Only real
-  # tokens are attended to.
-  input_mask = [0] * len(input_ids)
-
-  # Zero-pad up to the sequence length.
-  if len(input_ids) < max_seq_length:
-    delta_len = max_seq_length - len(input_ids)
-    if use_bert_format:
-      input_ids = input_ids + [0] * delta_len
-      input_mask = input_mask + [1] * delta_len
-      segment_ids = segment_ids + [SEG_ID_PAD] * delta_len
-    else:
-      input_ids = [0] * delta_len + input_ids
-      input_mask = [1] * delta_len + input_mask
-      segment_ids = [SEG_ID_PAD] * delta_len + segment_ids
-
-  assert len(input_ids) == max_seq_length
-  assert len(input_mask) == max_seq_length
-  assert len(segment_ids) == max_seq_length
-
-  if label_list is not None:
-    label_id = label_map[example['label']]
-  else:
-    label_id = example['label']
-
-  return {'token_ids': input_ids,
-          'token_mask': input_mask,
-          'segment_ids': segment_ids,
-          'label_ids': label_id,
-          'is_real_example': True}
-  
-
-
-def _file_based_convert_examples_to_features(examples,
-                                             label_list,
-                                             max_seq_length,
-                                             _tokenize_fn,
-                                             sp,
-                                             output_file,
-                                             num_passes=1):
-
-  writer = tf.io.TFRecordWriter(output_file)
-  examples *= num_passes
-
-  for (ex_index, example) in enumerate(examples):
-
-    feature = _convert_single_example(ex_index,
-                                      example,
-                                      label_list,
-                                      max_seq_length,
-                                      _tokenize_fn,
-                                      sp, 
-                                      use_bert_format=False)
-
-    def create_int_feature(values):
-      f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
-      return f
-
-    def create_float_feature(values):
-      f = tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
-      return f
-
-    features = {} 
-    features["token_ids"] = create_int_feature(feature['token_ids'])
-    features["token_mask"] = create_float_feature(feature['token_mask'])
-    features["segment_ids"] = create_int_feature(feature['segment_ids'])
-    if label_list is not None:
-      features["label_ids"] = create_int_feature([feature['label_ids']])
-    else:
-      features["label_ids"] = create_float_feature(
-          [float(feature['label_ids'])])
-    features["is_real_example"] = create_int_feature(
-        [int(feature['is_real_example'])])
-
-    tf_example = tf.train.Example(features=tf.train.Features(feature=features))
-    writer.write(tf_example.SerializeToString())
-  writer.close()
+      record_writer.write(tf.train.Example(features=tf.train.Features(
+          feature=feature)).SerializeToString())
 
 
 def main(_):
@@ -185,28 +141,26 @@ def main(_):
   data_path = FLAGS.data_path
   train_output_file_path = FLAGS.train_output_file_path
   dev_output_file_path = FLAGS.dev_output_file_path
-  max_seq_length = FLAGS.max_seq_length
+  seq_len = FLAGS.seq_len
 
   label_list = ['neg', 'pos']
-  sp = spm.SentencePieceProcessor()
-  sp.Load(spiece_model_path)
+  sp_model = spm.SentencePieceProcessor()
+  sp_model.Load(spiece_model_path)
 
-  train_examples = _create_examples(os.path.join(data_path, 'train'))
-  np.random.shuffle(train_examples)
-  eval_examples = _create_examples(os.path.join(data_path, 'test'))  
+  train_instances = _read_imdb_data(os.path.join(data_path, 'train'))
+  np.random.shuffle(train_instances)
+  eval_instances = _read_imdb_data(os.path.join(data_path, 'test'))
 
-  _file_based_convert_examples_to_features(train_examples,
-                                           label_list,
-                                           max_seq_length,
-                                           _tokenize_fn,
-                                           sp,
-                                           train_output_file_path)
-  _file_based_convert_examples_to_features(eval_examples,
-                                           label_list,
-                                           max_seq_length,
-                                           _tokenize_fn,
-                                           sp,
-                                           dev_output_file_path)
+  _convert_imdb_instances_to_tfrecord(train_instances,
+                                      label_list,
+                                      seq_len,
+                                      sp_model,
+                                      train_output_file_path)
+  _convert_imdb_instances_to_tfrecord(eval_instances,
+                                      label_list,
+                                      seq_len,
+                                      sp_model,
+                                      dev_output_file_path)
 
 
 if __name__ == '__main__':

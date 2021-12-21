@@ -1,19 +1,16 @@
 """Defines utility functions for evaluating on SQuAD 2.0 dataset."""
-import re, pickle
-import string
-import os
-import tensorflow as tf
 import collections
 import json
-import sentencepiece as spm
-import unicodedata
-import gc
+import os
+
 import numpy as np
-import math
+import tensorflow as tf
+from absl import logging
 
 from text_utils import encode_ids
 from text_utils import encode_pieces
-from text_utils import SEG_ID_P 
+from text_utils import normalize_answer
+from text_utils import SEG_ID_P
 from text_utils import SEG_ID_Q
 from text_utils import SEG_ID_CLS
 from text_utils import SEG_ID_PAD
@@ -22,45 +19,73 @@ from text_utils import SEP_ID
 from text_utils import SPIECE_UNDERLINE
 
 
-def get_tokens(s):
-  if not s:
-    return []
-  return normalize_answer(s).split()
+def compute_similarity_prediction(gt_ans, pred_ans):
+  """Computes the set-similarty based prediction score.
 
+  Both groundtruth and predicted answer will be split up into
+  whitespace-separated tokens (two sets of strings). Then we compute the
+  precision and recall by checking how similar the predicted set is to the
+  groundtruth set (jaccard similarity).
 
-def compute_f1(a_gold, a_pred):
-  """Computes f1 score."""
-  gold_toks = get_tokens(a_gold)
-  pred_toks = get_tokens(a_pred)
-  common = collections.Counter(gold_toks) & collections.Counter(pred_toks)
+  Args:
+    gt_ans: string scalar, groundtruth answer text.
+    pred_ans: string scalar, predicted answer text.
+
+  Returns:
+    f1: float scalar, f1 score.
+  """
+  # get space-separated tokens
+  get_tokens = lambda s: [] if not s else normalize_answer(s).split()
+
+  # list of word-tokens
+  gt_tokens = get_tokens(gt_ans)
+  # list of word-tokens
+  pred_tokens = get_tokens(pred_ans)
+
+  common = collections.Counter(gt_tokens) & collections.Counter(pred_tokens)
   num_same = sum(common.values())
-  # pylint: disable=g-explicit-length-test
-  if len(gold_toks) == 0 or len(pred_toks) == 0:
+
+  if len(gt_tokens) == 0 or len(pred_tokens) == 0:
     # If either is no-answer, then F1 is 1 if they agree, 0 otherwise
-    return int(gold_toks == pred_toks)
+    return int(gt_tokens == pred_tokens)
   if num_same == 0:
     return 0
-  precision = 1.0 * num_same / len(pred_toks)
-  recall = 1.0 * num_same / len(gold_toks)
+  precision = num_same / len(pred_tokens)
+  recall = num_same / len(gt_tokens)
   f1 = (2 * precision * recall) / (precision + recall)
   return f1
 
-def compute_exact(a_gold, a_pred):
-  return int(normalize_answer(a_gold) == normalize_answer(a_pred))
 
-def make_qid_to_has_ans(dataset):
-  qid_to_has_ans = {}
-  for article in dataset:
-    for p in article["paragraphs"]:
-      for qa in p["qas"]:
-        qid_to_has_ans[qa["id"]] = bool(qa["answers"])
-  return qid_to_has_ans
+def compute_exact_prediction(gt_ans, pred_ans):
+  """Compute the whole-text prediction score (1 if predicted text matches
+  precisely the groudtruth text and 0 otherwise).
 
-def get_raw_scores(dataset, preds):
-  """Gets exact scores and f1 scores."""
+  Args:
+    gt_ans: string scalar, groundtruth answer text.
+    pred_ans: string scalar, predicted answer text.
+
+  Returns:
+    score: int scalar, 1 if correct and 0 if incorrect.
+  """
+  score = int(normalize_answer(gt_ans) == normalize_answer(pred_ans))
+  return score
+
+
+def get_raw_scores(orig_data, pred_ans_text):
+  """Compute predictions scores for each question answer instance using the
+  *exact* or *similarity* metric.
+
+  Args:
+    orig_data: a list of dicts, dev split of the SQuAD dataset.
+    pred_ans_text: dict, mapping qid to predicted text.
+
+  Return:
+    exact_scores: dict, mapping qid to whole-text prediction score.
+    f1_scores: dict, mapping qid to set-similarty based prediction score.
+  """
   exact_scores = {}
   f1_scores = {}
-  for article in dataset:
+  for article in orig_data:
     for p in article["paragraphs"]:
       for qa in p["qas"]:
         qid = qa["id"]
@@ -70,167 +95,173 @@ def get_raw_scores(dataset, preds):
         if not gold_answers:
           # For unanswerable questions, only correct answer is empty string
           gold_answers = [""]
-        if qid not in preds:
-          print("Missing prediction for %s" % qid)
+        if qid not in pred_ans_text:
+          logging.warning("Missing prediction for %s" % qid)
           continue
-        a_pred = preds[qid]
+        a_pred = pred_ans_text[qid]
         # Take max over all gold answers
-        exact_scores[qid] = max(compute_exact(a, a_pred) for a in gold_answers)
-        f1_scores[qid] = max(compute_f1(a, a_pred) for a in gold_answers)
+        exact_scores[qid] = max(compute_exact_prediction(a, a_pred)
+                                for a in gold_answers)
+        f1_scores[qid] = max(compute_similarity_prediction(a, a_pred)
+                             for a in gold_answers)
   return exact_scores, f1_scores
 
-def _compute_softmax(scores):
-  """Computes softmax probability over raw logits."""
-  if not scores:
-    return []
 
-  max_score = None
-  for score in scores:
-    if max_score is None or score > max_score:
-      max_score = score
+def find_best_score(pred_ans_text,
+                    scores,
+                    pred_answerability,
+                    gt_answerability):
+  """Find the best score of the prediction accuracy for two tasks.
 
-  exp_scores = []
-  total_sum = 0.0
-  for score in scores:
-    x = math.exp(score - max_score)
-    exp_scores.append(x)
-    total_sum += x
+  1. The answer text prediction task, i.e. percentage of correct text
+    predictions (exact metric or set similarity based metric) out of all
+    predictions.
+  2. The answerability prediction task, i.e. percentage of correct answerability
+    predictions out of all answerable questions.
 
-  probs = []
-  for score in exp_scores:
-    probs.append(score / total_sum)
-  return probs
+  Args:
+    pred_ans_text: dict, mapping qid to predicted text.
+    scores: dict, mapping qid to prediction score.
+    pred_answerability: dict, mapping qid to predicted answerability score (
+      lower value means higher answerability).
+    gt_answerability: dict, mapping qid to groundtruth answerability (1 for
+      answerable, 0 for unanswerable).
 
+  Return:
+    accuracy_text: float scalar, accuracy of text prediction task.
+    best_thresh: float scalar, best answerability threshold for text prediction
+      task.
+    accuracy_answerability: float scalar, accuracy of answerability task.
+  """
+  # start with the thresh that predicts all instances unanswerable, so the total
+  # number of correct predictions is just the number of unanswerable questions.
+  num_unanswerable = sum(1 for k in gt_answerability if not gt_answerability[k])
+  best_num_correct = curr_num_correct = num_unanswerable
+  best_thresh = None
 
-def find_all_best_thresh(main_eval, preds, exact_raw, f1_raw, na_probs,
-                         qid_to_has_ans):
-  """Finds all best threshold."""
-  best_exact, exact_thresh, has_ans_exact = find_best_thresh(
-      preds, exact_raw, na_probs, qid_to_has_ans)
-  best_f1, f1_thresh, has_ans_f1 = find_best_thresh(preds, f1_raw, na_probs,
-                                                    qid_to_has_ans)
-  main_eval["best_exact"] = best_exact
-  main_eval["best_exact_thresh"] = exact_thresh
-  main_eval["best_f1"] = best_f1
-  main_eval["best_f1_thresh"] = f1_thresh
-  main_eval["has_ans_exact"] = has_ans_exact
-  main_eval["has_ans_f1"] = has_ans_f1
+  # then iterate through the predictions in ascending order of
+  # `pred_answerability`, from answerable to unanswerable, i.e. 'lowering' the
+  # thresh to allow for more 'answerable' predictions.
+  qid_list = sorted(pred_answerability, key=lambda k: pred_answerability[k])
 
-def find_best_thresh(preds, scores, na_probs, qid_to_has_ans):
-  """Finds best threshold."""
-  num_no_ans = sum(1 for k in qid_to_has_ans if not qid_to_has_ans[k])
-  cur_score = num_no_ans
-  best_score = cur_score
-  best_thresh = 0.0
-  qid_list = sorted(na_probs, key=lambda k: na_probs[k])
   for qid in qid_list:
     if qid not in scores:
       continue
-    if qid_to_has_ans[qid]:
-      diff = scores[qid]
+    if gt_answerability[qid]:
+      # add to the number of correct predictions, if it is indeed answerable,
+      # and we predict that it is answerable
+      delta = scores[qid]
     else:
-      if preds[qid]:
-        diff = -1
+      # if it is indeed unanswerable, we subtract 1 from the current count of
+      # correct predictions, if we mistakenly predict that it is answerable
+      if pred_ans_text[qid]:
+        delta = -1
       else:
-        diff = 0
-    cur_score += diff
-    if cur_score > best_score:
-      best_score = cur_score
-      best_thresh = na_probs[qid]
+        delta = 0
+    curr_num_correct += delta
+    if curr_num_correct > best_num_correct:
+      best_num_correct = curr_num_correct
+      best_thresh = pred_answerability[qid]
 
-  has_ans_score, has_ans_cnt = 0, 0
+  num_correct_answerability, num_total_answerability = 0, 0
   for qid in qid_list:
-    if not qid_to_has_ans[qid]:
+    if not gt_answerability[qid]:
       continue
-    has_ans_cnt += 1
+    num_total_answerability += 1
 
     if qid not in scores:
       continue
-    has_ans_score += scores[qid]
+    num_correct_answerability += scores[qid]
 
-  return 100.0 * best_score / len(
-      scores), best_thresh, 1.0 * has_ans_score / has_ans_cnt
+  accuracy_text = best_num_correct / len(scores)
+  accuracy_answerability = num_correct_answerability / num_total_answerability
 
-def normalize_answer(s):
-  """Lower text and remove punctuation, articles and extra whitespace."""
-
-  def remove_articles(text):
-    regex = re.compile(r"\b(a|an|the)\b", re.UNICODE)
-    return re.sub(regex, " ", text)
-
-  def white_space_fix(text):
-    return " ".join(text.split())
-
-  def remove_punc(text):
-    exclude = set(string.punctuation)
-    return "".join(ch for ch in text if ch not in exclude)
-
-  def lower(text):
-    return text.lower()
-
-  return white_space_fix(remove_articles(remove_punc(lower(s))))
+  return accuracy_text, best_thresh, accuracy_answerability
 
 
+def postprocess_predictions(eval_feature_list,
+                            n_best_size,
+                            max_ans_len,
+                            predict_dir,
+                            orig_data,
+                            start_n_top,
+                            end_n_top):
+  """
+  Args:
+    eval_feature_list: list of dict, each dict contains prediction results and
+      other data related to a question answer instance.
+    n_best_size: int scalar, number of best scoring predictions.
+    max_ans_len: int scalar, max length of answer text.
+                            output_prediction_file,
+                            output_nbest_file,
+                            output_null_log_odds_file,
+    orig_data: a list of dicts, dev split of the SQuAD dataset.
+    start_n_top: int scalar, the number of top-scoring predictions for start
+      position.
+    end_n_top: int scalar, the number of top-scoring predictions for end
+      position.
 
+  Returns:
+    results: dict with the following entries
+      'best_exact' -> float scalar, accuracy of exact text prediction
+      'best_exact_thresh' -> float scalar, best threshold of exact text
+        prediction
+      'has_ans_exact' -> float scalar, accuracy of exact answerability
+        prediction
+      'best_f1' -> float scalar, accuracy of set similarity based text
+        prediction
+      'best_f1_thresh': float scalar, best threshold of set similarity based
+        text prediction
+      'has_ans_f1': float scalar, accuracy of set similarity based answerability
+        prediction
+  """
+  eval_instance_list = []
+  for i in range(len(orig_data)):
+    for j in range(len(orig_data[i]['paragraphs'])):
+      for k in range(len(orig_data[i]['paragraphs'][j]['qas'])):
+        q_text = orig_data[i]['paragraphs'][j]['qas'][k]['question']
+        p_text = orig_data[i]['paragraphs'][j]['context']
+        qa_id = orig_data[i]['paragraphs'][j]['qas'][k]['id']
+        z = {'q_text': q_text, 'p_text': p_text, 'qa_id': qa_id}
+        eval_instance_list.append(z)
 
-def write_predictions(all_examples,
-                      all_features,
-                      n_best_size,
-                      max_answer_length,
-                      output_prediction_file,
-                      output_nbest_file,
-                      output_null_log_odds_file,
-                      orig_data,
-                      start_n_top,
-                      end_n_top):
-  print('examples', len(all_examples))
-  print('features', len(all_features))
+  # one instance (paragraph) may correspond to multiple features (seq spans)
+  instance_index_to_features = collections.defaultdict(list)
+  for feature in eval_feature_list:
+    instance_index_to_features[feature['instance_index']].append(feature)
 
-  example_index_to_features = collections.defaultdict(list)
-  for feature in all_features:
-    example_index_to_features[feature['example_index']].append(feature)
-
-
-  all_predictions = collections.OrderedDict()
+  pred_ans_text = collections.OrderedDict()
   all_nbest_json = collections.OrderedDict()
-  scores_diff_json = collections.OrderedDict()
+  pred_answerability = collections.OrderedDict()
 
-  for example_index, example in enumerate(all_examples):
-    features = example_index_to_features[example_index]
+  # iterate through question answer instances
+  for instance_index, instance in enumerate(eval_instance_list):
+    features = instance_index_to_features[instance_index]
 
+    # predictions over {all sequence spans} X {start indices} X {end indices}
+    # for the current question answer instance
     prelim_predictions = []
-    # keep track of the minimum score of null start+end of position 0
-    score_null = 1000000  # large and positive
 
+    # lower score means higher answerability
+    answerability_score = 1000000
+
+    # iterate through predictions over all sequence spans (features)
+    # corresponding to the same instance
     for feature_index, feature in enumerate(features):
+      answerability_score = min(answerability_score, feature['cls_logits'])
 
-      # if we could have irrelevant answers, get the min score of irrelevant
-      score_null = min(score_null, feature['cls_logits'])
-
+      # iterate through predictions overl all combinations of start and end
+      # indices
       for i in range(start_n_top):
         for j in range(end_n_top):
           start_log_prob = feature['start_top_log_probs'][i]
           start_index = feature['start_top_index'][i]
+          end_log_prob = feature['end_top_log_probs'][i*end_n_top+j]
+          end_index = feature['end_top_index'][i*end_n_top+j]
 
-          j_index = i * end_n_top + j
-
-          end_log_prob = feature['end_top_log_probs'][j_index]
-          end_index = feature['end_top_index'][j_index]
-
-          # We could hypothetically create invalid predictions, e.g., predict
-          # that the start of the span is in the question. We throw out all
-          # invalid predictions.
-          if start_index >= feature['paragraph_len'] - 1:
-            continue
-          if end_index >= feature['paragraph_len'] - 1:
-            continue
-
-          if not feature['token_is_max_context'].get(start_index, False):
-            continue
-          if end_index < start_index:
-            continue
-          length = end_index - start_index + 1
-          if length > max_answer_length:
+          if not (start_index <= end_index < feature['paragraph_len'] - 1
+              and end_index - start_index + 1 <= max_ans_len
+              and feature['token_is_max_context'].get(start_index, False)):
             continue
 
           prelim_predictions.append(
@@ -240,31 +271,33 @@ def write_predictions(all_examples,
                'start_log_prob': start_log_prob,
                'end_log_prob': end_log_prob})
 
-
+    # sort predictions in descending order of the sum of start and end logprobs
     prelim_predictions = sorted(
         prelim_predictions,
-        key=lambda x: (x['start_log_prob'] + x['end_log_prob']),
+        key=lambda pred: (pred['start_log_prob'] + pred['end_log_prob']),
         reverse=True)
 
-    seen_predictions = {}
+    seen_predictions = set()
     nbest = []
     for pred in prelim_predictions:
       if len(nbest) >= n_best_size:
         break
       feature = features[pred['feature_index']]
 
+      # convert token-based start and end index to char-based for final
+      # evaluation
       tok_start_to_orig_index = feature['tok_start_to_orig_index']
       tok_end_to_orig_index = feature['tok_end_to_orig_index']
       start_orig_pos = tok_start_to_orig_index[pred['start_index']]
       end_orig_pos = tok_end_to_orig_index[pred['end_index']]
 
-      paragraph_text = example['p_text']
+      paragraph_text = instance['p_text']
       final_text = paragraph_text[start_orig_pos:end_orig_pos + 1].strip()
 
       if final_text in seen_predictions:
         continue
 
-      seen_predictions[final_text] = True
+      seen_predictions.add(final_text)
 
       nbest.append(
           {'text': final_text,
@@ -272,7 +305,7 @@ def write_predictions(all_examples,
            'end_log_prob': pred['end_log_prob']})
 
     # In very rare edge cases we could have no valid predictions. So we
-    # just create a nonce prediction in this case to avoid failure.
+    # just create a dummpy prediction in this case to avoid failure.
     if not nbest:
       nbest.append(
           {'text': '', 'start_log_prob': -1e6, 'end_log_prob': -1e6})
@@ -284,7 +317,10 @@ def write_predictions(all_examples,
       if not best_non_null_entry:
         best_non_null_entry = entry
 
-    probs = _compute_softmax(total_scores)
+    # compute probabilities over all valid predictions
+    total_scores = np.array(total_scores)
+    exp = np.exp(total_scores - total_scores.max())
+    probs = (exp / exp.sum()).tolist()
 
     nbest_json = []
     for i, entry in enumerate(nbest):
@@ -295,87 +331,41 @@ def write_predictions(all_examples,
       output["end_log_prob"] = entry['end_log_prob']
       nbest_json.append(output)
 
-    assert len(nbest_json) >= 1
-    assert best_non_null_entry is not None
+    pred_answerability[instance['qa_id']] = answerability_score
+    pred_ans_text[instance['qa_id']] = best_non_null_entry['text']
+    all_nbest_json[instance['qa_id']] = nbest_json
 
-    score_diff = score_null
-    scores_diff_json[example['qa_id']] = score_diff
+  if not tf.io.gfile.exists(predict_dir):
+    tf.io.gfile.mkdir(predict_dir)
 
-    all_predictions[example['qa_id']] = best_non_null_entry['text']
-
-    all_nbest_json[example['qa_id']] = nbest_json
-
+  output_prediction_file = os.path.join(predict_dir, 'predictions.json')
+  output_nbest_file = os.path.join(predict_dir, 'nbest_predictions.json')
+  output_null_log_odds_file = os.path.join(predict_dir, 'null_odds.json')
   with tf.io.gfile.GFile(output_prediction_file, "w") as writer:
-    writer.write(json.dumps(all_predictions, indent=4) + "\n")
-
+    writer.write(json.dumps(pred_ans_text, indent=4) + "\n")
   with tf.io.gfile.GFile(output_nbest_file, "w") as writer:
     writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
-
   with tf.io.gfile.GFile(output_null_log_odds_file, "w") as writer:
-    writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
+    writer.write(json.dumps(pred_answerability, indent=4) + "\n")
 
-  qid_to_has_ans = make_qid_to_has_ans(orig_data)
-  exact_raw, f1_raw = get_raw_scores(orig_data, all_predictions)
-  out_eval = {}
+  gt_answerability = {}
+  for article in orig_data:
+    for p in article["paragraphs"]:
+      for qa in p["qas"]:
+        gt_answerability[qa["id"]] = bool(qa["answers"])
 
-  find_all_best_thresh(out_eval, all_predictions, exact_raw, f1_raw,
-                       scores_diff_json, qid_to_has_ans)
+  exact_raw, setsim_raw = get_raw_scores(orig_data, pred_ans_text)
 
-  return out_eval
+  exact_acc_text, exact_best_thresh, exact_acc_ans = find_best_score(
+      pred_ans_text, exact_raw, pred_answerability, gt_answerability)
+  setsim_acc_text, setsim_best_thresh, setsim_acc_ans = find_best_score(
+      pred_ans_text, setsim_raw, pred_answerability, gt_answerability)
 
-
-def run_evaluation(dataset, eval_examples, eval_features,
-                   original_data, input_meta_data, model):
-
-  index = 0
-  for inputs in dataset:
-
-    input_ids = inputs['token_ids']
-    segment_ids = inputs['segment_ids']
-    token_mask = inputs['token_mask'][:, None]
-    p_mask = inputs['p_mask']
-    cls_index = inputs['cls_index']
-
-    (start_top_log_probs,
-     start_top_index,
-     end_top_log_probs,
-     end_top_index,
-     cls_logits) = model(
-        input_ids, segment_ids, token_mask, p_mask, cls_index, training=False)
-
-    start_top_log_probs = start_top_log_probs.numpy()
-    start_top_index = start_top_index.numpy()
-    end_top_log_probs = end_top_log_probs.numpy()
-    end_top_index = end_top_index.numpy()
-    cls_logits = cls_logits.numpy()
-
-    batch_size = start_top_log_probs.shape[0]
-
-    for i in range(batch_size):
-      eval_features[index]['start_top_log_probs'] = start_top_log_probs[i].tolist()
-      eval_features[index]['start_top_index'] = start_top_index[i].tolist()
-
-      eval_features[index]['end_top_log_probs'] = end_top_log_probs[i].tolist()
-
-      eval_features[index]['end_top_index'] = end_top_index[i].tolist()
-
-      eval_features[index]['cls_logits'] = cls_logits[i].tolist()
-
-      index += 1
-
-  output_prediction_file = os.path.join(input_meta_data["predict_dir"],
-                                        "predictions.json")
-  output_nbest_file = os.path.join(input_meta_data["predict_dir"],
-                                   "nbest_predictions.json")
-  output_null_log_odds_file = os.path.join(input_meta_data["predict_dir"],
-                                           "null_odds.json")
-
-  results = squad_utils.write_predictions(
-      eval_examples, eval_features, input_meta_data["n_best_size"],
-      input_meta_data["max_answer_length"], output_prediction_file,
-      output_nbest_file, output_null_log_odds_file, original_data,
-      input_meta_data["start_n_top"], input_meta_data["end_n_top"])
+  results = {'best_exact': exact_acc_text,
+             'best_exact_thresh': exact_best_thresh,
+             'has_ans_exact': exact_acc_ans,
+             'best_f1': setsim_acc_text,
+             'best_f1_thresh': setsim_best_thresh,
+             'has_ans_f1': setsim_acc_ans}
 
   return results
-
-

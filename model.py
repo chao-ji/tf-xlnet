@@ -7,8 +7,8 @@ from commons.layers import RelativeAttention
 
 from model_utils import cache_memory
 from model_utils import compute_attention_mask
-from model_utils import compute_position_encoding
-from model_utils import compute_segment_matrix 
+from model_utils import get_position_encoding_xlnet
+from model_utils import compute_segment_matrix
 from model_utils import get_position_encoding
 
 
@@ -34,8 +34,9 @@ class DecoderLayer(tf.keras.layers.Layer):
       filter_size: int scalar, the depth of the intermediate dense layer of the
         feed-forward sublayer.
       dropout_rate: (Optional) float scalar, dropout rate for the Dropout layers
+        . Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
+        the query-to-reference attention matrix. Defaults to 0.
       filter_activation: (Optional) callable or string, activation function of
         the filter dense layer. Defaults to ReLU.
     """
@@ -75,12 +76,12 @@ class DecoderLayer(tf.keras.layers.Layer):
 
     Args:
       content_stream: float tensor of shape [batch_size, q_seq_len, hidden_size]
-        , the query sequences for TransformerXL or the content stream for 
+        , the query sequences for TransformerXL or the content stream for
         pre-training XLNet.
       content_mask: float tensor of shape [batch_size, 1, q_seq_len, c_seq_len],
-        token mask for content stream. 
+        token mask for content stream.
       context: float tensor of shape [batch_size, c_seq_len, hidden_size], the
-        context sequences to which the query sequences will attend. 
+        context sequences to which the query sequences will attend.
       position_encoding: float tensor of shape [batch_size, r_seq_len,
         hidden_size], the position encoding for the context sequences.
       content_bias: float tensor of shape [num_heads, size_per_head], content
@@ -95,19 +96,20 @@ class DecoderLayer(tf.keras.layers.Layer):
         or not.
       segment_bias: float tensor of shape [num_heads, size_per_head], segment
         bias.
-      query_stream: (Optional) float tensor of shape [batch_size,
-        num_predictions, hidden_size], the query stream for pre-training XLNet. 
+      query_stream: (Optional) float tensor of shape [batch_size, num_predict,
+        hidden_size], the query stream for pre-training XLNet. Defaults to None.
       query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
-        c_seq_len], token mask for query stream.
-      target_mapping: (Optional) float tensor of shape [batch_size,
-        num_predictions, q_seq_len], one-hot encodings of the indices of
-        prediction targets. 
-      training: (Optional) bool scalar, True if in training mode.
+        c_seq_len], token mask for query stream. Defaults to None.
+      target_mapping: (Optional) float tensor of shape [batch_size, num_predict,
+        q_seq_len], one-hot encodings of the indices of prediction targets.
+        Defaults to None.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
 
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden_size], for
         single stream input; or a tuple of two tensors of shape [batch_size,
-        q_seq_len, hidden_size] and [batch_size, num_predictions, hidden_size].
+        q_seq_len, hidden_size] and [batch_size, num_predict, hidden_size].
     """
     kwargs = {'content_stream': content_stream,
               'content_mask': content_mask,
@@ -134,7 +136,7 @@ class DecoderLayer(tf.keras.layers.Layer):
     else:
       content_outputs = self._mha(**kwargs)
       content_outputs = self._process_stream(
-          content_stream, content_outputs, training=training) 
+          content_stream, content_outputs, training=training)
       return content_outputs
 
   def _process_stream(self, inputs, outputs, training=False):
@@ -144,12 +146,13 @@ class DecoderLayer(tf.keras.layers.Layer):
     Args:
       inputs: float tensor of shape [batch_size, q_seq_len, hidden_size], inputs
         to `DecoderLayer`.
-      outputs: float tensor of shape [batch_size, q_seq_len, hidden_size], 
+      outputs: float tensor of shape [batch_size, q_seq_len, hidden_size],
         results of attention computation.
-      training: (Optional) bool scalar, True if in training mode.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
 
     Returns:
-      outputs: float tensor of shape [batch_size, q_seq_len, hidden_size], 
+      outputs: float tensor of shape [batch_size, q_seq_len, hidden_size],
         results of `outputs` after processing.
     """
     outputs = self._dropout_mha(outputs, training=training)
@@ -174,27 +177,29 @@ class TransformerXLModel(tf.keras.layers.Layer):
                reuse_len=0,
                dropout_rate=0.0,
                dropout_rate_attention=0.0,
-               tie_biases=True,
+               tie_biases=False,
                filter_activation=tf.nn.relu):
     """Constructor.
 
     Args:
       vocab_size: int scalar, vocabulary size.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
+        Defaults to 6.
       hidden_size: (Optional) int scalar, the hidden size of continuous
-        representation.
-      num_heads: (Optional) int scalar, num of attention heads.
+        representation. Defaults to 512.
+      num_heads: (Optional) int scalar, num of attention heads. Defaults to 8.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
-        layer of the feed-forward sublayer.
-      mem_len: (Optional) int scalar, num tokens to be cached.
+        layer of the feed-forward sublayer. Defaults to 2048.
+      mem_len: (Optional) int scalar, num tokens to be cached. Defaults to 0.
       reuse_len: (Optional) int scalar, num of tokens to be reused in the next
-        batch.
+        batch. Defaults to 0.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
+        the query-to-reference attention matrix. Defaults to 0.
       tie_biases: (Optional) bool scalar, whether to force all layers use the
         same content bias and position bias (True), or create the biases for
-        each layer (False).
+        each layer (False). Defaults to False.
       filter_activation: (Optional) callable or string, activation function of
         the filter dense layer. Defaults to ReLU.
     """
@@ -284,31 +289,35 @@ class TransformerXLModel(tf.keras.layers.Layer):
       content_mask: float tensor of shape [batch_size, 1, q_seq_len, m_seq_len +
         q_seq_len], permutation mask for the content stream.
       position_encoding: float tensor of shape [batch_size, m_seq_len +
-        2 * q_seq_len, hidden_size], encodings of the relative position 
+        2 * q_seq_len, hidden_size], encodings of the relative position
         information.
       segment_matrix: float tensor of shape [batch_size, q_seq_len, m_seq_len +
         q_seq_len], indicator matrix specifying if two positions are from the
         same segment or not.
-      query_stream: (Optional) float tensor of shape [batch_size,
-        num_predictions, hidden_size], input query stream.
+      query_stream: (Optional) float tensor of shape [batch_size, num_predict,
+        hidden_size], input query stream. Defaults to None.
       query_mask: (Optional) float tensor of shape [batch_size, 1, q_seq_len,
-        m_seq_len + q_seq_len], permutation mask for the query stream.
+        m_seq_len + q_seq_len], permutation mask for the query stream. Defaults
+        to None.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
-        block.
-      target_mapping: (Optional) float tensor of shape [batch_size,
-        num_predictions, q_seq_len], one-hot encodings of the indices of
-        prediction targets.
-      training: (Optional) bool scalar, True if in training mode.
- 
+        block. Defaults to None.
+      target_mapping: (Optional) float tensor of shape [batch_size, num_predict,
+        q_seq_len], where `target_mapping[b, i]` is the one-hot encoding of the
+        index of the prediction target for the `i` prediction task (out of
+        `num_predict`). May be zero-padded in the 2nd dimension. Defaults to
+        None.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
+
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
         content stream in new representation, if `two_stream` is False; Or, a
-        tuple of two float tensors of shape [batch_size, num_predictions,
+        tuple of two float tensors of shape [batch_size, num_predict,
         hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
         output query stream and updated memory, if `two_stream` is True.
     """
-    new_mems = [] 
+    new_mems = []
     mems = [None] * self._stack_size if mems is None else tf.unstack(
         mems, axis=1)
 
@@ -323,7 +332,6 @@ class TransformerXLModel(tf.keras.layers.Layer):
         content_bias, position_bias, segment_bias = (self._content_bias[i],
                                                      self._position_bias[i],
                                                      self._segment_bias[i])
-      segment_encoding = self._segment_encoding
 
       outputs = self._stack[i](
           content_stream,
@@ -333,7 +341,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
           position_encoding,
           content_bias,
           position_bias,
-          segment_encoding[i],
+          self._segment_encoding[i],
           segment_matrix,
           segment_bias,
           query_stream=query_stream,
@@ -346,7 +354,7 @@ class TransformerXLModel(tf.keras.layers.Layer):
       else:
         content_stream, query_stream = outputs
 
-    if query_stream is None: 
+    if query_stream is None:
       return content_stream
     else:
       new_mems = tf.stack(new_mems, axis=1)
@@ -364,7 +372,7 @@ class XLNetModel(tf.keras.layers.Layer):
                num_heads=8,
                filter_size=2048,
                dropout_rate=0.0,
-               dropout_rate_attention=0.0, 
+               dropout_rate_attention=0.0,
                tie_biases=False,
                two_stream=True,
                uni_data=False,
@@ -373,25 +381,27 @@ class XLNetModel(tf.keras.layers.Layer):
 
     Args:
       vocab_size: int scalar, vocabulary size.
-      mem_len: (Optional) int scalar, num tokens to be cached.
+      mem_len: (Optional) int scalar, num tokens to be cached. Defaults to 0.
       reuse_len: (Optional) int scalar, num of tokens to be reused in the next
-        batch.
+        batch. Defaults to 0.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
+        Defaults to 6.
       hidden_size: (Optional) int scalar, the hidden size of continuous
-        representation.
-      num_heads: (Optional) int scalar, num of attention heads.
+        representation. Defaults to 512.
+      num_heads: (Optional) int scalar, num of attention heads. Defaults to 8.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
-        layer of the feed-forward sublayer.
+        layer of the feed-forward sublayer. Defaults to 2048.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
+        the query-to-reference attention matrix. Defaults to 0.
       tie_biases: bool scalar, whether to force all layers use the same content,
         position and segment bias (True), or create the biases for each layer (
         False).
       two_stream: (Optional) bool scalar, whether to process both content and
-        query stream (True) or just content stream (False).
+        query stream (True) or just content stream (False). Defaults to True.
       uni_data: (Optional) bool scalar, whether the data is unidirectional or
-        bidirectional. Defaults to False.
+        bidirectional. Defaults to False. Defaults to False.
       filter_activation: (Optional) callable or string, activation function of
         the filter dense layer. Defaults to ReLU.
     """
@@ -399,7 +409,7 @@ class XLNetModel(tf.keras.layers.Layer):
     self._vocab_size = vocab_size
     self._mem_len = mem_len
     self._reuse_len = reuse_len
-    self._stack_size = stack_size 
+    self._stack_size = stack_size
     self._hidden_size = hidden_size
     self._num_heads = num_heads
     self._filter_size = filter_size
@@ -436,7 +446,7 @@ class XLNetModel(tf.keras.layers.Layer):
     if self._two_stream:
       self._mask_embedding = self.add_weight(
               'mask_embedding',
-              shape=[1, 1, self._hidden_size],
+              shape=[self._hidden_size],
               initializer=tf.keras.initializers.RandomNormal(
                   mean=0., stddev=self._hidden_size ** -0.5),
               dtype='float32',
@@ -445,51 +455,60 @@ class XLNetModel(tf.keras.layers.Layer):
 
   def call(self,
            inputs,
-           segment_ids,
-           permutation_mask,
+           seg_ids,
+           input_mask,
            target_mapping=None,
-           mems=None):
+           mems=None,
+           training=False):
     """Computes the output query stream and update the memories.
 
     Args:
-      inputs: int tensor of shape [batch_size, q_seq_len], token ids of input
-        query sequences of the current batch.
-      segment_ids: int tensor of shape [batch_size, q_seq_len], matrix populated
-        with 0, 1, or 2, which indicates the corresponding index in `inputs`
-        is from the first and second sequence segment, or is the `CLS` token.
-      permutation_mask: int tensor of shape [batch_size, q_seq_len, q_seq_len],
-        binary matrix where 1 means the corresponding position cannot be
-        attended to.
-      target_mapping: (Optional) float tensor of shape [batch_size,
-        num_predictions, q_seq_len], one-hot encodings of the indices of
-        prediction targets.
+      inputs: int tensor of shape [batch_size, q_seq_len], sequences of token
+        IDs.
+      seg_ids: int tensor of shape [batch_size, q_seq_len], segment ids where
+        `seg_ids[b]` is a vector of segment IDs for each token in `inputs`.
+      input_mask: float tensor of shape [batch_size, q_seq_len, q_seq_len],
+        input mask where the `i`th token cannot attend the `j`th token if
+        `input_mask[b, i, j] = 1`.
+      target_mapping: (Optional) float tensor of shape [batch_size, num_predict,
+        q_seq_len], where `target_mapping[b, i]` is the one-hot encoding of the
+        index of the prediction target for the `i` prediction task (out of
+        `num_predict`). May be zero-padded in the 2nd dimension. Defaults to
+        None.
       mems: (Optional) float tensor of shape [batch_size, stack_size, m_seq_len
         , hidden_size], encodings of the memory sequences from the previous
-        block.
+        block. Defaults to None.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
 
     Returns:
       outputs: float tensor of shape [batch_size, q_seq_len, hidden], the input
         content stream in new representation, if `two_stream` is False; Or, a
-        tuple of two float tensors of shape [batch_size, num_predictions,
+        tuple of two float tensors of shape [batch_size, num_predict,
         hidden_size] and [batch_size, stack_size, m_seq_len, hidden_size], the
         output query stream and updated memory, if `two_stream` is True.
     """
     batch_size = tf.shape(inputs)[0]
     q_seq_len = tf.shape(inputs)[1]
-    m_seq_len = 0 if mems is None else tf.shape(mems[0])[1]
+    m_seq_len = 0 if mems is None else tf.shape(mems)[2]
+    hidden_size = self._hidden_size
     content_mask, query_mask = compute_attention_mask(
-        permutation_mask, m_seq_len, q_seq_len)
+        input_mask, m_seq_len, q_seq_len)
 
-    relative_position_encoding = self._dropout_layer(compute_position_encoding(
-        self._hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data))
+    relative_position_encoding = self._dropout_layer(
+        get_position_encoding_xlnet(
+            hidden_size, batch_size, m_seq_len, q_seq_len, self._uni_data),
+        training=training)
     segment_matrix = compute_segment_matrix(
-        segment_ids, m_seq_len, self._two_stream)
+        seg_ids, m_seq_len, self._two_stream)
 
-    content_stream = self._dropout_layer(self._embedding_layer(inputs))
+    content_stream = self._dropout_layer(
+        self._embedding_layer(inputs), training=training)
 
     if self._two_stream:
-      query_stream = self._dropout_layer(tf.tile(self._mask_embedding,
-          [batch_size, tf.shape(target_mapping)[1], 1]))
+      query_stream = self._dropout_layer(tf.tile(
+          self._mask_embedding[tf.newaxis, tf.newaxis],
+          [batch_size, tf.shape(target_mapping)[1], 1]), training=training)
     else:
       query_stream = None
 
@@ -501,7 +520,7 @@ class XLNetModel(tf.keras.layers.Layer):
         query_stream,
         query_mask,
         mems,
-        target_mapping)
+        target_mapping, training)
 
     return outputs
 
@@ -516,8 +535,9 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
       start_n_top: int scalar, the number of top-scoring predictions for start
         position.
       end_n_top: int scalar, the number of top-scoring predictions for end
-        postion.
+        position.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
     """
     super(QuestionAnswerLogits, self).__init__()
     self._hidden_size = hidden_size
@@ -543,36 +563,55 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
         units=1,
         kernel_initializer=None,
         use_bias=False)
-    self._answer_feature_dropout = tf.keras.layers.Dropout(rate=self._dropout_rate)
+    self._answer_feature_dropout = tf.keras.layers.Dropout(
+        rate=self._dropout_rate)
 
   def call(self,
            inputs,
-           paragraph_mask,
+           para_mask,
            cls_index,
            start_positions=None,
-           is_impossible=None,
            training=True):
     """Computes logits for start position, end position and the `CLS` token.
 
     Args:
       inputs: float tensor of shape [batch_size, seq_len, hidden_size], vector
         representation for sequences.
-      paragraph_mask: float tensor of shape [batch_size, seq_len], mask for
-        paragraph tokens.
+      para_mask: float tensor of shape [batch_size, seq_len], mask for paragraph
+        tokens.
       cls_index: int tensor of shape [batch_size], indices of the CLS token in
         `inputs`.
       start_positions: (Optional) int tensor of shape [batch_size], answer start
-        positions.
-      is_impossible: (Optional) float tensor of shape [batch_size], indicating
-        if question is answerable.
-      training: (Optional) bool scalar, True if in training mode.
+        positions. Defaults to None.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        True.
+
+    Returns:
+      if training is True
+        start_logits_masked: float tensor of shape [batch_size, seq_len], logits
+          of predictions of start indices over the entire sequence.
+        end_logits_masked: float tensor of shape [batch_size, seq_len], logits
+          of predictions of end indices over the entire sequence.
+        cls_logits: float tensor of shape [batch_size], logits of answerability
+          predictions.
+      if training is False
+        start_top_log_probs: float tensor of shape [batch_size, start_n_top],
+          logits of top scoring predictions of start indices.
+        start_top_index: float tensor of shape [batch_size, start_n_top],
+          start indices of top scoring predictions.
+        end_top_log_probs: float tensor of shape [batch_size, start_n_top *
+          end_n_top], logits of top scoring predictions of end indices.
+        end_top_index: float tensor of shape [batch_size, start_n_top *
+          end_n_top], end indices of top scoring predictions.
+        cls_logits:  float tensor of shape [batch_size], logits of
+          answerability predictions.
     """
-    seq_len = tf.shape(inputs)[1]  
+    seq_len = tf.shape(inputs)[1]
     inputs = tf.transpose(inputs, [1, 0, 2])
     start_logits = self._start_logits_dense_layer(inputs)
     start_logits = tf.transpose(tf.squeeze(start_logits, -1), [1, 0])
-    start_logits_masked = start_logits * (1 - paragraph_mask
-        ) + NEG_INF * paragraph_mask
+    start_logits_masked = start_logits * (1 - para_mask
+        ) + NEG_INF * para_mask
     if training:
       start_index = tf.one_hot(
           start_positions, depth=seq_len, axis=-1, dtype='float32')
@@ -583,8 +622,8 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
       end_logits = self._end_logits_layer_norm(end_logits)
       end_logits = self._end_logits_dense_layer1(end_logits)
       end_logits = tf.transpose(tf.squeeze(end_logits, -1), [1, 0])
-      end_logits_masked = end_logits * (1 - paragraph_mask
-          ) + NEG_INF * paragraph_mask
+      end_logits_masked = end_logits * (1 - para_mask
+          ) + NEG_INF * para_mask
     else:
       start_log_probs = tf.nn.log_softmax(start_logits_masked, -1)
       start_top_log_probs, start_top_index = tf.nn.top_k(
@@ -606,8 +645,8 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
       end_logits = self._end_logits_dense_layer1(end_logits)
       end_logits = tf.reshape(end_logits, [seq_len, -1, self._start_n_top])
       end_logits = tf.transpose(end_logits, [1, 2, 0])
-      end_logits_masked = end_logits * (1 - paragraph_mask[:, tf.newaxis]
-          ) + NEG_INF * paragraph_mask[:, tf.newaxis]
+      end_logits_masked = end_logits * (1 - para_mask[:, tf.newaxis]
+          ) + NEG_INF * para_mask[:, tf.newaxis]
       end_log_probs = tf.nn.log_softmax(end_logits_masked, -1)
       end_top_log_probs, end_top_index = tf.nn.top_k(
           end_log_probs, k=self._end_n_top)
@@ -622,7 +661,7 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
     start_feature = tf.einsum('TND,NT->ND', inputs, start_p)
     ans_feature = tf.concat([start_feature, cls_feature], -1)
     ans_feature = self._answer_class_dense_layer0(ans_feature)
-    ans_feature = self._answer_feature_dropout(ans_feature)
+    ans_feature = self._answer_feature_dropout(ans_feature, training=training)
     cls_logits = self._answer_class_dense_layer1(ans_feature)
     cls_logits = tf.squeeze(cls_logits, -1)
 
@@ -637,7 +676,7 @@ class QuestionAnswerLogits(tf.keras.layers.Layer):
 
 
 class PretrainingXLNet(XLNetModel):
-  """XLNet for pretraining."""
+  """XLNet purposed for pretraining."""
   def __init__(self,
                vocab_size,
                mem_len,
@@ -656,17 +695,19 @@ class PretrainingXLNet(XLNetModel):
       mem_len: int scalar, num tokens to be cached.
       reuse_len: int scalar, num of tokens to be reused in the next batch.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
+        Defaults to 6.
       hidden_size: (Optional) int scalar, the hidden size of continuous
-        representation.
-      num_heads: (Optional) int scalar, num of attention heads.
+        representation. Defaults to 512.
+      num_heads: (Optional) int scalar, num of attention heads. Defaults to 8.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
-        layer of the feed-forward sublayer.
+        layer of the feed-forward sublayer. Defaults to 2048.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
-      tie_biases: bool scalar, whether to force all layers use the same content,
-        position and segment bias (True), or create the biases for each layer (
-        False).
+        the query-to-reference attention matrix. Defaults to 0.
+      tie_biases: (Optional) bool scalar, whether to force all layers use the
+        same content, position and segment bias (True), or create the biases for
+        each layer (False). Defaults to False.
     """
     super(PretrainingXLNet, self).__init__(
         vocab_size=vocab_size,
@@ -697,30 +738,42 @@ class PretrainingXLNet(XLNetModel):
     self._bias_output= self.add_weight(
         'bias_output',
         shape=[self._vocab_size],
-        initializer=tf.zeros_initializer())
+        initializer=tf.zeros_initializer(),
+        dtype='float32',
+        trainable=True)
     super(PretrainingXLNet, self).build(inputs_shape)
 
-  def call(self, inputs, segment_ids, permutation_mask, target_mapping, mems):
+  def call(self, inputs, seg_ids, perm_mask, target_mapping, mems):
     """Compute permutation language modeling logits and update memory.
 
     Args:
-        inputs: int tensor of shape [batch_size, seq_len], token IDs for input
-            sequences.
-        segment_ids: int tensor of shape [batch_size, seq_len], segment IDs for
-            tokens in input sequences.
-        permutation_mask: bool tensor of shape [batch_size, seq_len, seq_len],
-        target_mapping: float tensor of shape [batch_size, num_predictions,
-          q_seq_len], one-hot encodings of the indices of prediction targets.
-        mems: float tensor of shape [batch_size, stack_size, m_seq_len
-          , hidden_size], encodings of the memory sequences from the previous
-          block.
+      inputs: int tensor of shape [batch_size, q_seq_len], sequences of token
+        IDs.
+      seg_ids: int tensor of shape [batch_size, q_seq_len], segment ids where
+        `seg_ids[b]` is a vector of segment IDs for each token in `inputs`.
+      perm_mask: float tensor of shape [batch_size, q_seq_len, q_seq_len],
+        permutation mask where the `i`th token cannot attend the
+        `j`th token if `perm_mask[b, i, j] = 1`.
+      target_mapping: float tensor of shape [batch_size, num_predict,
+        q_seq_len], where `target_mapping[b, i]` is the one-hot encoding of
+        the index of the prediction target for the `i` prediction task (out of
+        `num_predict`). May be zero-padded in the 2nd dimension.
+      mems: float tensor of shape [batch_size, stack_size, m_seq_len
+        , hidden_size], encodings of the memory sequences from the previous
+        block.
 
     Returns:
-        logits: float tensor of shape [batch_size,]
-        new_mems: float tensor of shape [batch_size, mem_len, hidden_size]
+      logits: float tensor of shape [batch_size, num_predict, vocab_size],
+        logits of predicted tokens over the vocabulary.
+      new_mems: float tensor of shape [batch_size, stack_size, m_seq_len,
+        hidden_size], the updated memory.
     """
-    outputs, new_mems = super(PretrainingXLNet, self).call(
-        inputs, segment_ids, permutation_mask, target_mapping, mems)
+    outputs, new_mems = super(PretrainingXLNet, self).call(inputs,
+                                                           seg_ids,
+                                                           perm_mask,
+                                                           target_mapping,
+                                                           mems,
+                                                           training=True)
     outputs = self._layernorm_output(self._dense_layer_output(outputs))
     logits = tf.einsum('NPD,VD->NPV', outputs, self._embedding_layer.weights[0]
         ) + self._bias_output
@@ -731,9 +784,9 @@ class PretrainingXLNet(XLNetModel):
 class QuestionAnswerXLNet(XLNetModel):
   """XLNet model for question-answer tasks (e.g. SQuAD).
 
-  Computes logits for start position, end position and the `CLS` token.
+  Computes logits for start position, end position and the answerability.
   """
-  def __init__(self, 
+  def __init__(self,
                vocab_size,
                stack_size=6,
                hidden_size=512,
@@ -749,21 +802,23 @@ class QuestionAnswerXLNet(XLNetModel):
     Args:
       vocab_size: int scalar, vocabulary size.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
+        Defaults to 6.
       hidden_size: (Optional) int scalar, the hidden size of continuous
-        representation.
-      num_heads: (Optional) int scalar, num of attention heads.
+        representation. Defaults to 512.
+      num_heads: (Optional) int scalar, num of attention heads. Defaults to 8.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
-        layer of the feed-forward sublayer.
+        layer of the feed-forward sublayer. Defaults to 2048.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
-      tie_biases: bool scalar, whether to force all layers use the same content,
-        position and segment bias (True), or create the biases for each layer (
-        False).
+        the query-to-reference attention matrix. Defaults to 0.
+      tie_biases: (Optional) bool scalar, whether to force all layers use the
+        same content, position and segment bias (True), or create the biases for
+        each layer (False). Defaults to False.
       start_n_top: (Optional) int scalar, the number of top-scoring predictions
-        for start position.
+        for start position. Defaults to 5.
       end_n_top: (Optional) int scalar, the number of top-scoring predictions
-        for end postion.
+        for end position. Defaults to 5.
     """
     super(QuestionAnswerXLNet, self).__init__(
         vocab_size=vocab_size,
@@ -784,35 +839,57 @@ class QuestionAnswerXLNet(XLNetModel):
 
   def call(self,
            inputs,
-           segment_ids,
-           permutation_mask,
-           p_mask,
+           seg_ids,
+           input_mask,
+           para_mask,
            cls_index,
            start_positions=None,
-           is_impossible=None,
            training=False):
-    """
+    """Computes logits for start position, end position, and answerability.
+
     Args:
-      inputs: int tensor of shape [batch_size, seq_len]
-      segment_ids: int tensor of shape [batch_size, seq_len]
-      permutation_mask: bool tensor of shape [batch_size, 1, seq_len]
-      p_mask: bool tensor of shape [batch_size, seq_len]
-      cls_index: int tensor of shape [batch_size] 
-      start_positions: (Optional) int tensor of shape [batch_size] 
-      end_postions: (Optional) int tensor of shape [batch_size]
-      is_impossible: (Optional) bool tensor of shape [batch_size]
-      training: (Optional) bool scalar, True if in training mode.
+      inputs: int tensor of shape [batch_size, q_seq_len], sequences of token
+        IDs.
+      seg_ids: int tensor of shape [batch_size, q_seq_len], segment ids where
+        `seg_ids[b]` is a vector of segment IDs for each token in `inputs`.
+      input_mask: float tensor of shape [batch_size, 1, q_seq_len], input mask
+        mask where the `i`th token cannot attend the `j`th token if
+        `input_mask[b, i, j] = 1`.
+      para_mask: bool tensor of shape [batch_size, q_seq_len], paragraph mask
+        where the `para_mask[b, i]` is 0 if the `i`th token is paragraph token.
+      cls_index: int tensor of shape [batch_size], indices of the CLS token in
+        `inputs`.
+      start_positions: (Optional) int tensor of shape [batch_size], answer start
+        positions. Defaults to None.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
 
     Returns:
-      outputs:   
+      if training is True
+        start_logits_masked: float tensor of shape [batch_size, seq_len], logits
+          of predictions of start indices over the entire sequence.
+        end_logits_masked: float tensor of shape [batch_size, seq_len], logits
+          of predictions of end indices over the entire sequence.
+        cls_logits: float tensor of shape [batch_size], logits of answerability
+          predictions.
+      if training is False
+        start_top_log_probs: float tensor of shape [batch_size, start_n_top],
+          logits of top scoring predictions of start indices.
+        start_top_index: float tensor of shape [batch_size, start_n_top],
+          start indices of top scoring predictions.
+        end_top_log_probs: float tensor of shape [batch_size, start_n_top *
+          end_n_top], logits of top scoring predictions of end indices.
+        end_top_index: float tensor of shape [batch_size, start_n_top *
+          end_n_top], end indices of top scoring predictions.
+        cls_logits:  float tensor of shape [batch_size], logits of
+          answerability predictions.
     """
     outputs = super(QuestionAnswerXLNet, self).call(
-        inputs, segment_ids, permutation_mask)
+        inputs, seg_ids, input_mask, training=training)
     outputs = self._logits_layer(outputs,
-                                 p_mask,
+                                 para_mask,
                                  cls_index,
                                  start_positions=start_positions,
-                                 is_impossible=is_impossible,
                                  training=training)
     return outputs
 
@@ -834,18 +911,20 @@ class ClassificationXLNet(XLNetModel):
     Args:
       vocab_size: int scalar, vocabulary size.
       stack_size: (Optional) int scalar, num of layers in the decoder stack.
+        Defaults to 6.
       hidden_size: (Optional) int scalar, the hidden size of continuous
-        representation.
-      num_heads: (Optional) int scalar, num of attention heads.
+        representation. Defaults to 512.
+      num_heads: (Optional) int scalar, num of attention heads. Defaults to 8.
       filter_size: (Optional) int scalar, the depth of the intermediate dense
-        layer of the feed-forward sublayer.
+        layer of the feed-forward sublayer. Defaults to 2048.
       dropout_rate: (Optional) float scalar, dropout rate for Dropout layers.
+        Defaults to 0.
       dropout_rate_attention: (Optional) float scalar, dropout rate applied on
-        the query-to-reference attention matrix.
-      tie_biases: bool scalar, whether to force all layers use the same content,
-        position and segment bias (True), or create the biases for each layer (
-        False).
-      num_classes: (Optional) int scalar, num of classes.
+        the query-to-reference attention matrix. Defaults to 0.
+      tie_biases: (Optional) bool scalar, whether to force all layers use the
+        same content, position and segment bias (True), or create the biases for
+        each layer (False). Defaults to False.
+      num_classes: (Optional) int scalar, num of classes. Defaults to 2.
     """
     super(ClassificationXLNet, self).__init__(
         vocab_size=vocab_size,
@@ -867,21 +946,26 @@ class ClassificationXLNet(XLNetModel):
     self._dense_layer_logits = tf.keras.layers.Dense(
         units=num_classes, kernel_initializer=None)
 
-  def call(self, inputs, segment_ids, input_mask):
-    """
+  def call(self, inputs, seg_ids, input_mask, training=False):
+    """Computes logits for sequence label predictions.
 
     Args:
-      inputs: [batch_size, seq_len]
-      segment_ids: [batch_size, seq_len]
-      input_mask: [batch_size, 1, seq_len]
+      inputs: float tensor of shape [batch_size, seq_len], sequences of token
+        IDs.
+      seg_ids: int tensor of shape [batch_size, seq_len], segment ids where
+        `seg_ids[b]` is a vector of segment IDs for each token in `inputs`.
+      input_mask: float tensor of shape [batch_size, 1, seq_len], input mask
+        where `input_mask[b, :, i] = 1` if the `i`th token is to be masked.
+      training: (Optional) bool scalar, True if in training mode. Defaults to
+        False.
 
     Returns:
-      logits: float tensor of shape [batch_size, num_classes], logits for
-        classification.
+      logits: float tensor of shape [batch_size, num_classes], logits of
+        sequence label predictions.
     """
     outputs = super(ClassificationXLNet, self).call(
-        inputs, segment_ids, input_mask)[:, -1]
-    outputs = self._dropout_layer(self._dense_layer_output(outputs))
+        inputs, seg_ids, input_mask, training=training)[:, -1]
+    outputs = self._dropout_layer(
+        self._dense_layer_output(outputs), training=training)
     logits = self._dense_layer_logits(outputs)
-
     return logits

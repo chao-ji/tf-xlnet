@@ -10,316 +10,308 @@ import sentencepiece as spm
 import tensorflow as tf
 from absl import app
 from absl import flags
+from absl import logging
 
 from text_utils import encode_ids
 from text_utils import preprocess_text
 from text_utils import CLS_ID
 from text_utils import SEP_ID
 from text_utils import EOD_ID
-
+from text_utils import SEG_ID_P
+from text_utils import SEG_ID_Q
+from text_utils import SEG_ID_CLS
 
 flags.DEFINE_list(
-    'input_file_paths', None, 'Paths to raw text files to be converted.')
+    'input_file_paths', None, 'Paths to raw text files to be processed.')
 flags.DEFINE_string(
     'spiece_model_path', None, 'Path to SentencePiece model file.')
 flags.DEFINE_string(
-    'output_file_path', 'pretrain.tfrecord', 'Path to the output tfrecord '
-    'file.')    
+    'output_file_path', 'pretrain.tfrecord', 'Path to the output TFRecord '
+    'file.')
 flags.DEFINE_bool(
-    'use_eod', True, 'Whether to add End-Of-Document token (EOD).')
+    'use_eod', True, 'Whether to add the special token EOD to the end of '
+    'document.')
 flags.DEFINE_integer(
-    'batch_size', 4, 'Batch size.')
+    'batch_size', 2, 'Number of sequences in a batch.')
 flags.DEFINE_integer(
     'seq_len', 512, 'Length of sequence in a batch.')
 flags.DEFINE_bool(
     'bi_data', True, 'Whether to process text bidirectionally.')
 flags.DEFINE_integer(
-    'mask_alpha', 6, 'How many tokens to form a group.')
-flags.DEFINE_integer(
-    'mask_beta', 1, 'How many tokens to mask within each group.')
-flags.DEFINE_integer(
-    'reuse_len', 256, 'Number of token that can be reused as memory.')
-flags.DEFINE_integer(
-    'num_predict', 85, 'Num of tokens to predict.')
+    'reuse_len', 256, 'Number of tokens that can be reused as memory.')
 flags.DEFINE_bool(
-    'uncased', False, 'Use uncased inputs or not.')
+    'uncased', False, 'Whether to use uncased inputs.')
 
 FLAGS = flags.FLAGS
 
 
-def _split_a_and_b(data, sent_ids, begin_idx, tot_len, extend_target=False):
-  """Split two segments from `data` starting from the index `begin_idx`."""
+def _split_a_and_b(token_ids, sent_ids, begin_index, size):
+  """Sample seq a from `token_ids`, starting at `begin_index`. seq b either
+  follows immediately seq a, or is sampled randomly. Try making sure that seq a
+  and seq b starts and ends at sentence boundaries.
 
-  data_len = data.shape[0]
-  if begin_idx + tot_len >= data_len:
-    return None
+  Args:
+    token_ids: numpy array of shape [data_len], sequence of token IDs in a
+      single batch.
+    sent_ids: numpy array of shape [data_len], sequence of sentence IDs in a
+      sinlge batch.
+    begin_index: int, seq a will be sampled from `token_ids` starting at
+      `begin_index`.
+    size: int, total length of seq a and seq b.
 
-  end_idx = begin_idx + 1
+  Returns:
+    seq_a: numpy array of shape [seq_a_len], token IDs of seq a.
+    seq_b: numpy array of shape [seq_b_len], token IDs of seq b.
+    label: int, integer indicating if seq b immediately follows seq a (1) or is
+      sampled randomly (0).
+  """
+  data_len = token_ids.shape[0]
+
+  end_index = begin_index + 1
   cut_points = []
-  while end_idx < data_len:
-    if sent_ids[end_idx] != sent_ids[end_idx - 1]:
-      if end_idx - begin_idx >= tot_len: break
-      cut_points.append(end_idx)
-    end_idx += 1
+  while end_index < data_len:
+    if sent_ids[end_index] != sent_ids[end_index - 1]:
+      if end_index - begin_index >= size:
+        break
+      cut_points.append(end_index)
+    end_index += 1
 
-  a_begin = begin_idx
+  a_begin = begin_index
   if len(cut_points) == 0 or random.random() < 0.5:
+    # CASE 0: seq b is randomly sampled
     label = 0
     if len(cut_points) == 0:
-      a_end = end_idx
+      a_end = end_index
     else:
       a_end = random.choice(cut_points)
 
-    b_len = max(1, tot_len - (a_end - a_begin))
-    # (zihangd): `data_len - 1` to account for extend_target
-    b_begin = random.randint(0, data_len - 1 - b_len)
+    b_len = max(1, size - (a_end - a_begin))
+    b_begin = random.randint(0, data_len - b_len)
     b_end = b_begin + b_len
+
+    # expand seq b in both directions to make sure that `b_begin` and `b_end`
+    # sit at sentence boundaries.
     while b_begin > 0 and sent_ids[b_begin - 1] == sent_ids[b_begin]:
       b_begin -= 1
-    # (zihangd): `data_len - 1` to account for extend_target
-    while b_end < data_len - 1 and sent_ids[b_end - 1] == sent_ids[b_end]:
+    while b_end < data_len and sent_ids[b_end - 1] == sent_ids[b_end]:
       b_end += 1
-
-    new_begin = a_end
   else:
+    # CASE 1: seq b follows immediately seq a
     label = 1
     a_end = random.choice(cut_points)
     b_begin = a_end
-    b_end = end_idx
+    b_end = end_index
 
-    new_begin = b_end
-
-  while a_end - a_begin + b_end - b_begin > tot_len:
+  # while the total length of seq a and seq b > size,
+  # delete tokens one at a time on the right side
+  while a_end - a_begin + b_end - b_begin > size:
     if a_end - a_begin > b_end - b_begin:
-      # delete the right side only for the LM objective
       a_end -= 1
     else:
       b_end -= 1
 
-  ret = [data[a_begin: a_end], data[b_begin: b_end], label]
+  seq_a = token_ids[a_begin:a_end]
+  seq_b = token_ids[b_begin:b_end]
 
-  return ret
-
-
-def _batchify(data, bsz_per_host, sent_ids=None):
-  num_step = len(data) // bsz_per_host
-  data = data[:bsz_per_host * num_step]
-  data = data.reshape(bsz_per_host, num_step)
-  if sent_ids is not None:
-    sent_ids = sent_ids[:bsz_per_host * num_step]
-    sent_ids = sent_ids.reshape(bsz_per_host, num_step)
-
-  if sent_ids is not None:
-    return data, sent_ids
-  return data
+  return seq_a, seq_b, label
 
 
-def _create_tfrecords(output_path,
-                     data,
-                     bsz_per_host,
-                     seq_len,
-                     bi_data,
-                     sp,
-                     mask_alpha=6,
-                     mask_beta=1,
-                     reuse_len=256,
-                     uncased=False,
-                     num_predict=85,
-                      ):
-  data, sent_ids = data[0], data[1]
-  num_core_per_host = 1
+def _batch_data(token_ids, sent_ids, batch_size):
+  """Batch the input sequence of IDs.
 
-  num_core = num_core_per_host
-  bsz_per_core = bsz_per_host // num_core
+  Args:
+    token_ids: numpy array of shape [total_num_ids], all token IDs.
+    sent_ids: numpy array of shape [total_num_ids], sentence IDs of all tokens
+      (alternating 1's and 0's).
+    batch_size: int, number of sequences in a batch.
 
+  Returns:
+    token_ids: numpy array of shape [batch_size, data_len], batched sequences of
+      token IDs.
+    sent_ids: numpy array of shape [batch_size, data_len], batched sequences of
+      sentence IDs.
+  """
+  data_len = len(token_ids) // batch_size
+  token_ids = token_ids[:batch_size * data_len]
+  token_ids = token_ids.reshape(batch_size, data_len)
+  sent_ids = sent_ids[:batch_size * data_len]
+  sent_ids = sent_ids.reshape(batch_size, data_len)
+
+  return token_ids, sent_ids
+
+
+def _create_tfrecords(output_file_path,
+                      token_ids,
+                      sent_ids,
+                      batch_size,
+                      seq_len,
+                      bi_data,
+                      reuse_len=256):
+  """Write token IDs into TFRecord files.
+
+  Args:
+    output_file_path: string, path to the output TFRecord file.
+    token_ids: numpy array of shape [total_num_ids], all token IDs.
+    sent_ids: numpy array of shape [total_num_ids], sentence IDs of all tokens
+      (alternating 1's and 0's).
+    batch_size: int, number of sequences in a batch.
+    seq_len: int, length of sequence in a batch.
+    bi_data: bool, whether to process text bidirectionally.
+    reuse_len: int, number of tokens that can be reused as memory.
+  """
   if bi_data:
-    assert bsz_per_host % (2 * num_core_per_host) == 0
-    fwd_data, fwd_sent_ids = _batchify(data, bsz_per_host // 2, sent_ids)
-
-    fwd_data = fwd_data.reshape(num_core, 1, bsz_per_core // 2, -1)
-    fwd_sent_ids = fwd_sent_ids.reshape(num_core, 1, bsz_per_core // 2, -1)
-
-    bwd_data = fwd_data[:, :, :, ::-1]
-    bwd_sent_ids = fwd_sent_ids[:, :, :, ::-1]
-
-    data = np.concatenate(
-        [fwd_data, bwd_data], 1).reshape(bsz_per_host, -1)
-    sent_ids = np.concatenate(
-        [fwd_sent_ids, bwd_sent_ids], 1).reshape(bsz_per_host, -1)
+    if batch_size % 2 != 0:
+      raise ValueError('`batch_size` must be divisible by 2 for bidirectional '
+          'input.')
+    fwd_token_ids, fwd_sent_ids = _batch_data(
+        token_ids, sent_ids, batch_size // 2)
+    bwd_token_ids = fwd_token_ids[:, ::-1]
+    bwd_sent_ids = fwd_sent_ids[:, ::-1]
+    token_ids = np.vstack([fwd_token_ids, bwd_token_ids])
+    sent_ids = np.vstack([fwd_sent_ids, bwd_sent_ids])
   else:
-    data, sent_ids = _batchify(data, bsz_per_host, sent_ids)
+    token_ids, sent_ids = _batch_data(token_ids, sent_ids, batch_size)
 
-  record_writer = tf.io.TFRecordWriter(output_path)
+  # each sequence in a batch has 2 SEP tokens and 1 CLS token.
+  if reuse_len >= seq_len - 3:
+    raise ValueError(f'It must hold that `reuse_len < seq_len - 3`, got '
+        'reuse_len = {reuse_len}, seq_len = {seq_len}')
 
-  num_batch = 0
-  reuse_len = reuse_len
+  sep_array = np.array([SEP_ID], dtype='int64')
+  cls_array = np.array([CLS_ID], dtype='int64')
 
-  # [sep] x 2 + [cls]
-  assert reuse_len < seq_len - 3
+  i, num_batches = 0, 0
+  counts = [0, 0]
+  with tf.io.TFRecordWriter(output_file_path) as record_writer:
+    while i + seq_len <= token_ids.shape[1]:
+      for index in range(batch_size):
+        data_a, data_b, label = _split_a_and_b(token_ids[index],
+                                               sent_ids[index],
+                                               begin_index=i+reuse_len,
+                                               size=seq_len-reuse_len-3)
 
-  data_len = data.shape[1]
-  sep_array = np.array([SEP_ID], dtype=np.int64)
-  cls_array = np.array([CLS_ID], dtype=np.int64)
+        batch_token_ids = np.concatenate([token_ids[index, i:i+reuse_len],
+            data_a, sep_array, data_b, sep_array, cls_array])
+        batch_seg_ids = ([SEG_ID_P] * (reuse_len + data_a.shape[0] + 1) +
+            [SEG_ID_Q] * (data_b.shape[0] + 1) + [SEG_ID_CLS])
 
-  i = 0
-  while i + seq_len <= data_len:
+        feature = {'token_ids': tf.train.Feature(
+            int64_list=tf.train.Int64List(value=batch_token_ids)),
+                   'seg_ids': tf.train.Feature(
+            int64_list=tf.train.Int64List(value=batch_seg_ids))}
 
-    all_ok = True
-    features = []
-    for idx in range(bsz_per_host):
-      inp = data[idx, i: i + reuse_len]
-
-      results = _split_a_and_b(
-          data[idx],
-          sent_ids[idx],
-          begin_idx=i + reuse_len,
-          tot_len=seq_len - reuse_len - 3,
-          extend_target=True)
-      if results is None:
-        all_ok = False
-        break
-
-      # unpack the results
-      (a_data, b_data, label) = tuple(results)
-
-      # concatenate data
-      cat_data = np.concatenate([inp, a_data, sep_array, b_data,
-                                 sep_array, cls_array])
-      seg_id = ([0] * (reuse_len + a_data.shape[0]) + [0] +
-                [1] * b_data.shape[0] + [1] + [2])
-      assert cat_data.shape[0] == seq_len
-
-      feature = {
-          "token_ids": tf.train.Feature(
-              int64_list=tf.train.Int64List(value=cat_data)),
-          "segment_ids": tf.train.Feature(
-              int64_list=tf.train.Int64List(value=seg_id)),
-      }
-      features.append(feature)
-
-    if all_ok:
-      assert len(features) == bsz_per_host
-      for feature in features:
         example = tf.train.Example(features=tf.train.Features(feature=feature))
         record_writer.write(example.SerializeToString())
-      num_batch += 1
-    else:
-      break
+        counts[label] += 1
+      num_batches += 1
 
-    i += reuse_len
+      i += reuse_len
+  logging.info(f'Total number of batches: {num_batches}')
+  logging.info(f'Sequence pair counts by type: {counts[0]}(0), {counts[1]}(1)')
 
-  record_writer.close()
 
-def _create_data(input_paths,
-                 sp_path,
+def _create_data(input_file_paths,
+                 spiece_model_path,
+                 output_file_path,
                  use_eod,
-                 output_path, 
-                 bsz_per_host=4,
+                 batch_size=4,
                  seq_len=512,
                  bi_data=True,
-                 mask_alpha=6,
-                 mask_beta=1,
                  reuse_len=256,
-                 num_predict=85,
                  uncased=False):
+  """Convert input text files into token IDs, shuffle the token-IDs at the file
+  level, and finally write the data to TFRecord files.
+
+  Args:
+    input_file_paths: list of strings, paths to raw text files to be processed.
+    spiece_model_path: string, path to SentencePiece model file.
+    output_file_path: string, path to the output TFRecord file.
+    use_eod: bool, whether to add the special token EOD to the end of document.
+    batch_size: int, number of sequences in a batch.
+    seq_len: int, length of sequence in a batch.
+    bi_data: bool, whether to process text bidirectionally.
+    reuse_len: int, number of tokens that can be reused as memory.
+    uncased: bool, whether to use uncased inputs.
+  """
   sp = spm.SentencePieceProcessor()
-  sp.Load(sp_path)
+  sp.Load(spiece_model_path)
 
-  input_shards = []
-  total_line_cnt = 0
-  for input_path in input_paths:
-    input_data, sent_ids = [], []
-    sent_id, line_cnt = True, 0
-    for line in tf.io.gfile.GFile(input_path):
-      line_cnt += 1
-
-      if not line.strip():
-        if use_eod:
-          sent_id = not sent_id
-          cur_sent = [EOD_ID]
+  # go through the raw text files and convert raw texts into token IDs
+  per_file_ids = []
+  for input_file_path in input_file_paths:
+    token_ids, sent_ids = [], []
+    sent_id = True
+    with tf.io.gfile.GFile(input_file_path) as f:
+      for line in f:
+        if not line.strip():
+          if use_eod:
+            # treat empty line as a sentence with only one token EOD
+            sent_id = not sent_id
+            curr_sent = [EOD_ID]
+          else:
+            continue
         else:
-          continue
-      else:
-        cur_sent = preprocess_text(
-            line.strip(), lower=uncased)
-        cur_sent = encode_ids(sp, cur_sent)
+          curr_sent = preprocess_text(
+              line.strip(), lower=uncased)
+          curr_sent = encode_ids(sp, curr_sent)
+        token_ids.extend(curr_sent)
+        sent_ids.extend([sent_id] * len(curr_sent))
+        sent_id = not sent_id
 
-      input_data.extend(cur_sent)
-      sent_ids.extend([sent_id] * len(cur_sent))
-      sent_id = not sent_id
-
-    if line_cnt == 0:
+    if len(token_ids) == 0:
       continue
 
-    input_data = np.array(input_data, dtype=np.int64)
-    sent_ids = np.array(sent_ids, dtype=np.bool)
+    token_ids = np.array(token_ids, dtype='int64')
+    sent_ids = np.array(sent_ids, dtype='bool')
+    per_file_ids.append((token_ids, sent_ids))
 
-    total_line_cnt += line_cnt
-    input_shards.append((input_data, sent_ids))
-
-  filenames, num_batch = [], 0
-
-  perm_indices = np.random.permutation(len(input_shards))
-
-  input_data_list, sent_ids_list = [], []
-  prev_sent_id = None 
-  for perm_idx in perm_indices:
-    input_data, sent_ids = input_shards[perm_idx]
+  # shuffle the token-IDs at the file level
+  perm_indices = np.random.permutation(len(per_file_ids))
+  token_ids_list, sent_ids_list = [], []
+  prev_sent_id = None
+  for index in perm_indices:
+    token_ids, sent_ids = per_file_ids[index]
 
     if prev_sent_id is not None and sent_ids[0] == prev_sent_id:
       sent_ids = np.logical_not(sent_ids)
 
-    input_data_list.append(input_data)
+    token_ids_list.append(token_ids)
     sent_ids_list.append(sent_ids)
 
     prev_sent_id = sent_ids[-1]
-
-  input_data = np.concatenate(input_data_list)
+  token_ids = np.concatenate(token_ids_list)
   sent_ids = np.concatenate(sent_ids_list)
 
-  _create_tfrecords(output_path,
-                   (input_data, sent_ids),
-                   bsz_per_host=bsz_per_host,
-                   seq_len=seq_len,
-                   bi_data=bi_data,
-                   sp=sp,
-                   mask_alpha=mask_alpha,
-                   mask_beta=mask_beta,
-                   reuse_len=reuse_len,
-                   uncased=uncased,
-                   num_predict=num_predict)
+  # write the data to TFRecord files
+  _create_tfrecords(output_file_path,
+                    token_ids,
+                    sent_ids,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    bi_data=bi_data,
+                    reuse_len=reuse_len)
 
-  return input_data, sent_ids
- 
 
 def main(_):
   input_file_paths = FLAGS.input_file_paths
   spiece_model_path = FLAGS.spiece_model_path
-  use_eod = FLAGS.use_eod
   output_file_path = FLAGS.output_file_path
+  use_eod = FLAGS.use_eod
   batch_size = FLAGS.batch_size
   seq_len = FLAGS.seq_len
   bi_data = FLAGS.bi_data
-  mask_alpha = FLAGS.mask_alpha
-  mask_beta = FLAGS.mask_beta
   reuse_len = FLAGS.reuse_len
-  num_predict = FLAGS.num_predict
   uncased = FLAGS.uncased
 
-  input_data, sent_ids = _create_data(
-      input_file_paths,
-      spiece_model_path,
-      use_eod,
-      output_file_path,
-      bsz_per_host=batch_size,
-      seq_len=seq_len,
-      bi_data=bi_data,
-      mask_alpha=mask_alpha,
-      mask_beta=mask_beta,
-      reuse_len=reuse_len,
-      num_predict=num_predict,
-      uncased=uncased,
-    )
+  _create_data(input_file_paths,
+               spiece_model_path,
+               output_file_path,
+               use_eod,
+               batch_size=batch_size,
+               seq_len=seq_len,
+               bi_data=bi_data,
+               reuse_len=reuse_len,
+               uncased=uncased)
 
 
 if __name__ == '__main__':
